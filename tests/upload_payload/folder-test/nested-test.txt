@@ -1,0 +1,2 @@
+ModelScope Manager folder upload test.
+This nested file verifies recursive folder upload.

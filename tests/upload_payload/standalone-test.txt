@@ -1,0 +1,2 @@
+ModelScope Manager standalone upload test.
+Generated on 2026-08-22.

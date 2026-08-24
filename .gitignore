@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+_ui_check.png
+_security_test.py
+data/
+runtime/
+dist/
+.ms_upload_cache

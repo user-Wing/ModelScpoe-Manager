@@ -1,0 +1,17 @@
+# Third-party components
+
+This portable distribution includes:
+
+- Python 3.12 — Python Software Foundation License
+- PySide6 Essentials / Qt for Python — LGPLv3/GPLv3/commercial licensing options
+- PySide6-Fluent-Widgets 1.11.3 — GPLv3 for non-commercial use or a separately purchased commercial license; source: https://github.com/zhiyiYo/PyQt-Fluent-Widgets/tree/PySide6
+- PySideSix-Frameless-Window 0.8.2 — LGPLv3; source: https://github.com/zhiyiYo/PyQt-Frameless-Window/tree/PySide6
+- darkdetect 0.8.0 — BSD-3-Clause
+- pywin32 312 — Python Software Foundation License
+- ModelScope Hub SDK — Apache License 2.0
+- aria2-next 2.5.6 — GNU General Public License v2 or later; source: https://github.com/AnInsomniacy/aria2-next
+- 7-Zip Zstandard 26.02 / Zstd 1.5.7 — LGPL-2.1-or-later and BSD-3-Clause components; license retained in `embedded-tools/7zip-zstd/License.txt`; source: https://github.com/mcmilk/7-Zip-zstd
+- PotPlayer is not distributed with ModelScope Manager. It is downloaded only when the user explicitly chooses installation, from the user-configured ModelScope dataset archive.
+- Requests, urllib3, tqdm, filelock, certifi, idna, charset-normalizer, colorama and their bundled license metadata
+
+Package license files and metadata are retained inside `runtime/Lib/site-packages`.

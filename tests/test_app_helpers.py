@@ -6,20 +6,23 @@ from unittest.mock import patch
 
 from PySide6.QtCore import QEvent, QMimeData, QPoint, QPointF, QSettings, Qt, QUrl
 from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent, QKeyEvent
+from PySide6.QtNetwork import QNetworkCookie
 from PySide6.QtWidgets import (
-    QApplication, QListWidgetItem, QMessageBox, QPushButton, QTreeWidgetItem,
+    QApplication, QLabel, QListWidgetItem, QMessageBox, QPushButton, QTreeWidgetItem,
 )
 from qfluentwidgets import SettingCardGroup
 
 import modelscope_manager.app as app_module
 from modelscope_manager.app import (
-    CopyThread, MainWindow, PathBreadcrumb, RepositoryList, RepositoryTree, ThumbnailThread,
+    CopyThread, DeleteThread, MainWindow, ModelScopeLoginDialog, PathBreadcrumb, RelocateThread,
+    RepositoryList, RepositoryTree, ThumbnailThread,
     THUMBNAIL_RENDER_SIZE, VIDEO_THUMBNAIL_SEEK_SECONDS,
+    UploadQueueItem,
     breadcrumb_levels, copy_name, everything_search_match, find_available_port,
     local_paths_size, repository_file_url, repository_is_public,
     thumbnail_batch_policy,
 )
-from modelscope_manager.fluent_ui import ControlSettingCard
+from modelscope_manager.fluent_ui import ControlSettingCard, PanelSettingCard
 from modelscope_manager.service import RemoteEntry, Repository
 
 
@@ -45,6 +48,14 @@ class FakeDropEvent:
 
 
 class AppHelperTests(unittest.TestCase):
+    def test_modelscope_login_cookie_parts_accept_qt_domain_string(self):
+        cookie = QNetworkCookie(b"m_session_id", b"session-value")
+        cookie.setDomain(".modelscope.cn")
+        self.assertEqual(
+            ModelScopeLoginDialog._cookie_parts(cookie),
+            ("m_session_id", "session-value", "modelscope.cn"),
+        )
+
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
@@ -155,6 +166,68 @@ class AppHelperTests(unittest.TestCase):
                 destination, repo, "",
             ).run()
             self.assertEqual(destination.uploads, [("a.txt", "folder-copy", "folder-copy/a.txt")])
+
+    def test_relocate_deletes_sources_only_after_every_upload_succeeds(self):
+        class Source:
+            def download_to_file(self, _repo, remote_path, target):
+                target.write_text(remote_path, encoding="utf-8")
+
+        class Destination:
+            def __init__(self, fail=""):
+                self.fail = fail
+
+            def upload_file_as(self, _repo, _local, remote_path):
+                if remote_path == self.fail:
+                    raise RuntimeError("upload failed")
+
+        repo = Repository("alice/example", "dataset")
+        mappings = {"old/a.txt": "new/a.txt", "old/b.txt": "new/b.txt"}
+        deleted = []
+        failed = RelocateThread(Source(), repo, Destination("new/b.txt"), repo, mappings, deleted.append)
+        failed.run()
+        self.assertEqual(deleted, [])
+        self.assertEqual(failed.result["upload_failed"], ["old/b.txt"])
+
+        succeeded = RelocateThread(Source(), repo, Destination(), repo, mappings, deleted.append)
+        succeeded.run()
+        self.assertEqual(deleted, ["old/b.txt", "old/a.txt"])
+        self.assertEqual(succeeded.result["deleted"], ["old/b.txt", "old/a.txt"])
+
+    def test_folder_mutations_expand_to_files_and_preserve_relative_paths(self):
+        selected = RemoteEntry("old/folder", is_dir=True)
+        entries = [
+            RemoteEntry("old/folder/a.txt", 1),
+            RemoteEntry("old/folder/deep/B.txt", 2),
+            RemoteEntry("old/other.txt", 3),
+        ]
+        self.assertEqual(
+            MainWindow._entry_file_paths(selected, entries),
+            ["old/folder/deep/B.txt", "old/folder/a.txt"],
+        )
+        self.assertEqual(
+            MainWindow._relocate_mappings(selected, entries, "new/Folder"),
+            {
+                "old/folder/a.txt": "new/Folder/a.txt",
+                "old/folder/deep/B.txt": "new/Folder/deep/B.txt",
+            },
+        )
+
+    def test_delete_thread_batches_files_and_reconciles_an_uncertain_commit(self):
+        repo = Repository("alice/example", "dataset")
+        paths = ["folder/a.txt", "folder/deep/b.txt"]
+        results = []
+        thread = DeleteThread(object(), repo, paths)
+        thread.completed.connect(results.append)
+        with (
+            patch.object(app_module, "delete_repository_files", side_effect=RuntimeError("timeout")) as batch,
+            patch.object(app_module, "list_repository_file_paths", return_value=["folder/deep/b.txt"]),
+            patch.object(app_module, "delete_repository_file") as single,
+        ):
+            thread.run()
+
+        batch.assert_called_once()
+        single.assert_called_once_with(thread.session, repo.repo_id, repo.repo_type, "folder/deep/b.txt")
+        self.assertEqual(results[0], {"deleted": paths, "failures": {}})
 
     def test_size_groups_use_requested_boundaries(self):
         self.assertEqual(MainWindow._size_group(1024 * 1024 - 1), "<1MB")
@@ -355,6 +428,35 @@ class AppHelperTests(unittest.TestCase):
                 self.assertEqual(settings.value("close_behavior"), "ask")
                 self.assertEqual(int(settings.value("copy/threshold_unit")), 1024 ** 2)
                 self.assertEqual(settings.value("alist/host"), "127.0.0.1")
+                account_texts = {label.text() for label in window.settings_page.findChildren(QLabel)}
+                self.assertIn("Token 登录", account_texts)
+                self.assertIn("ModelScope 账户 在线登录", account_texts)
+                panel_cards = {
+                    card.titleLabel.text(): card
+                    for card in window.settings_page.findChildren(PanelSettingCard)
+                }
+                account_card = panel_cards["ModelScope 账户"]
+                account_card.setExpanded(True, animated=False)
+                QApplication.processEvents()
+                self.assertEqual(window.token_heading_label.y(), window.add_account_button.y())
+                self.assertEqual(window.token_heading_label.y(), window.remove_account_button.y())
+                self.assertLess(window.token_heading_label.height(), window.add_account_button.height())
+                self.assertGreaterEqual(
+                    window.online_separator.y() - (window.account_label.y() + window.account_label.height()), 12,
+                )
+                player_card = panel_cards["媒体播放器"]
+                player_card.setExpanded(True, animated=False)
+                QApplication.processEvents()
+                self.assertEqual(window.player_heading_label.y(), window.add_player_button.y())
+                self.assertEqual(window.player_heading_label.y(), window.remove_player_button.y())
+                self.assertLess(window.player_heading_label.height(), window.add_player_button.height())
+                download_card = panel_cards["下载与传输"]
+                self.assertEqual(download_card.panel.layout().spacing(), 14)
+                aria_heading = next(
+                    label for label in download_card.panel.findChildren(QLabel)
+                    if label.text() == "aria2-next 详细配置"
+                )
+                self.assertEqual(aria_heading.parentWidget().layout().spacing(), 14)
                 close_event = QCloseEvent()
                 with (
                     patch.object(QMessageBox, "exec", return_value=0) as close_prompt,
@@ -373,6 +475,11 @@ class AppHelperTests(unittest.TestCase):
 
                 window.language_combo.setCurrentIndex(window.language_combo.findData("en_US"))
                 window.theme_combo.setCurrentIndex(window.theme_combo.findData("dark"))
+                window.upload_items = [UploadQueueItem(file_path, "", "uploading")]
+                window._render_upload_queue()
+                self.assertGreater(window.queue_table.item(0, 3).foreground().color().lightness(), 128)
+                window.upload_items.clear()
+                window._render_upload_queue()
                 window.close_behavior_combo.setCurrentIndex(window.close_behavior_combo.findData("tray"))
                 window.font_size_spin.setValue(11)
                 window.gpu_acceleration_checkbox.setChecked(False)

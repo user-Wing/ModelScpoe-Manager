@@ -49,3 +49,22 @@ class FolderSizeIndexTests(unittest.TestCase):
             self.assertEqual(index.update_folder(repo, "folder", entries), 10)
             self.assertEqual(index.cached_folder_size(repo, "folder"), 10)
             self.assertIsNone(index.cached_folder_size(repo, ""))
+
+    def test_remove_entries_decrements_ancestors_and_removes_subtree_rows(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "folder_sizes.sqlite3"
+            repo = Repository("alice/demo", "dataset")
+            index = FolderSizeIndex(path)
+            entries = [
+                RemoteEntry("folder/a.bin", 4),
+                RemoteEntry("folder/nested/b.bin", 6),
+                RemoteEntry("other.bin", 3),
+            ]
+            index.update_repository(repo, entries)
+
+            index.remove_entries(repo, entries[:2], ["folder"])
+
+            self.assertEqual(index.cached_folder_size(repo), 3)
+            self.assertIsNone(index.cached_folder_size(repo, "folder"))
+            self.assertIsNone(index.cached_folder_size(repo, "folder/nested"))
+            self.assertEqual(FolderSizeIndex(path).cached_folder_size(repo), 3)

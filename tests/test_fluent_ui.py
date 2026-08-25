@@ -3,7 +3,7 @@ import unittest
 from PySide6.QtCore import QAbstractAnimation, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
-from qfluentwidgets import ComboBox, FluentIcon, FluentWindow, SettingCard, SettingCardGroup, SpinBox
+from qfluentwidgets import ComboBox, FluentIcon, FluentWindow, MenuAnimationType, SettingCard, SettingCardGroup, SpinBox
 
 from modelscope_manager.app import MainWindow
 from modelscope_manager.fluent_ui import (
@@ -65,10 +65,13 @@ class FluentUiTests(unittest.TestCase):
         combo.addItem("浅色", userData="light")
         menu = combo._createComboMenu()
         combo._createComboMenu = lambda: menu
-        menu.exec = lambda *args, **kwargs: None
+        calls = []
+        menu.exec = lambda *args, **kwargs: calls.append((args, kwargs))
         combo._showComboMenu()
         self.assertTrue(menu.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground))
         self.assertTrue(menu.windowFlags() & Qt.WindowType.NoDropShadowWindowHint)
+        self.assertFalse(calls[0][1]["ani"])
+        self.assertEqual(calls[0][1]["aniType"], MenuAnimationType.NONE)
 
     def test_fluent_switch_exposes_checkbox_compatible_signal(self):
         switch = FluentSwitchButton()

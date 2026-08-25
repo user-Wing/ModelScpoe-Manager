@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+import json
 import re
 import shutil
 import sqlite3
@@ -10,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 from .security import protect, unprotect
+from .web_session import ModelScopeWebSession
 
 
 @dataclass
@@ -20,6 +22,14 @@ class AccountRecord:
     token: str = field(default="", repr=False)
     remember: bool = True
     enabled: bool = True
+    status: str = "waiting"
+
+
+@dataclass
+class WebAccountRecord:
+    account_id: str
+    label: str
+    username: str = ""
     status: str = "waiting"
 
 
@@ -116,6 +126,19 @@ def initialize_database(path: Path, legacy_folder_index: Path | None = None) -> 
                 sort_order INTEGER NOT NULL DEFAULT 0,
                 updated_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS account_web_sessions (
+                account_id TEXT PRIMARY KEY,
+                session_cipher TEXT NOT NULL,
+                session_device_id TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS web_accounts (
+                account_id TEXT PRIMARY KEY,
+                label TEXT NOT NULL,
+                username TEXT NOT NULL DEFAULT '',
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS repositories (
                 account_id TEXT NOT NULL,
                 repo_type TEXT NOT NULL,
@@ -206,6 +229,17 @@ def initialize_database(path: Path, legacy_folder_index: Path | None = None) -> 
             CREATE INDEX IF NOT EXISTS entry_tags_tag ON entry_tags(tag_name);
             """
         )
+        connection.execute(
+            """INSERT OR IGNORE INTO web_accounts
+               (account_id, label, username, sort_order, updated_at)
+               SELECT sessions.account_id,
+                      COALESCE(NULLIF(accounts.label, ''), NULLIF(accounts.username, ''), 'ModelScope 账户'),
+                      COALESCE(accounts.username, ''),
+                      COALESCE(accounts.sort_order, 0),
+                      sessions.updated_at
+               FROM account_web_sessions AS sessions
+               LEFT JOIN accounts ON accounts.account_id=sessions.account_id"""
+        )
         if legacy_folder_index and legacy_folder_index.exists() and legacy_folder_index.resolve() != path.resolve():
             legacy_connection = sqlite3.connect(legacy_folder_index)
             try:
@@ -230,8 +264,9 @@ class AccountStore:
         self.device_id = device_id
         self.tokens_destroyed = False
         if identity_replaced:
-            self.tokens_destroyed = self._saved_token_count() > 0
+            self.tokens_destroyed = self._saved_token_count() > 0 or self._saved_web_session_count() > 0
             self.destroy_all_tokens()
+            self.destroy_all_web_sessions()
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=15)
@@ -244,6 +279,13 @@ class AccountStore:
             return int(connection.execute(
                 "SELECT COUNT(*) FROM accounts WHERE token_cipher <> ''"
             ).fetchone()[0])
+        finally:
+            connection.close()
+
+    def _saved_web_session_count(self) -> int:
+        connection = self._connect()
+        try:
+            return int(connection.execute("SELECT COUNT(*) FROM account_web_sessions").fetchone()[0])
         finally:
             connection.close()
 
@@ -285,6 +327,64 @@ class AccountStore:
                     account.token = ""
                     account.status = "token_required"
         return output
+
+    def list_web_accounts(self) -> list[WebAccountRecord]:
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM web_accounts ORDER BY sort_order, updated_at, account_id"
+            ).fetchall()
+        finally:
+            connection.close()
+        output: list[WebAccountRecord] = []
+        for row in rows:
+            account_id = str(row["account_id"])
+            output.append(WebAccountRecord(
+                account_id,
+                str(row["label"]),
+                str(row["username"]),
+                "connected" if self.load_web_session(account_id) else "login_required",
+            ))
+        return output
+
+    def save_web_account(self, account: WebAccountRecord) -> WebAccountRecord:
+        account_id = account.account_id or str(uuid.uuid4())
+        connection = self._connect()
+        try:
+            existing = connection.execute(
+                "SELECT sort_order FROM web_accounts WHERE account_id=?", (account_id,)
+            ).fetchone()
+            order = int(existing[0]) if existing else int(connection.execute(
+                "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM web_accounts"
+            ).fetchone()[0])
+            connection.execute(
+                """INSERT OR REPLACE INTO web_accounts
+                   (account_id, label, username, sort_order, updated_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (
+                    account_id,
+                    account.label.strip() or account.username or "ModelScope 账户",
+                    account.username.strip(),
+                    order,
+                    int(time.time()),
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        account.account_id = account_id
+        return account
+
+    def remove_web_account(self, account_id: str) -> None:
+        connection = self._connect()
+        try:
+            connection.execute("DELETE FROM web_accounts WHERE account_id=?", (account_id,))
+            connection.execute("DELETE FROM account_web_sessions WHERE account_id=?", (account_id,))
+            connection.execute("DELETE FROM repositories WHERE account_id=?", (f"web:{account_id}",))
+            connection.execute("DELETE FROM entries WHERE account_id=?", (f"web:{account_id}",))
+            connection.commit()
+        finally:
+            connection.close()
 
     def save(self, account: AccountRecord) -> AccountRecord:
         account_id = account.account_id or str(uuid.uuid4())
@@ -348,6 +448,56 @@ class AccountStore:
         connection = self._connect()
         try:
             connection.execute("UPDATE accounts SET token_cipher='', token_device_id=''")
+            connection.commit()
+        finally:
+            connection.close()
+
+    def save_web_session(self, account_id: str, session: ModelScopeWebSession) -> None:
+        cipher = protect(json.dumps(session.to_dict(), ensure_ascii=False, separators=(",", ":")))
+        connection = self._connect()
+        try:
+            connection.execute(
+                """INSERT OR REPLACE INTO account_web_sessions
+                   (account_id, session_cipher, session_device_id, updated_at)
+                   VALUES (?, ?, ?, ?)""",
+                (account_id, cipher, self.device_id, int(time.time())),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def load_web_session(self, account_id: str) -> ModelScopeWebSession | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT session_cipher, session_device_id FROM account_web_sessions WHERE account_id=?",
+                (account_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        if not row:
+            return None
+        if str(row["session_device_id"]) != self.device_id:
+            self.destroy_web_session(account_id)
+            return None
+        try:
+            return ModelScopeWebSession.from_dict(json.loads(unprotect(str(row["session_cipher"]))))
+        except Exception:
+            self.destroy_web_session(account_id)
+            return None
+
+    def destroy_web_session(self, account_id: str) -> None:
+        connection = self._connect()
+        try:
+            connection.execute("DELETE FROM account_web_sessions WHERE account_id=?", (account_id,))
+            connection.commit()
+        finally:
+            connection.close()
+
+    def destroy_all_web_sessions(self) -> None:
+        connection = self._connect()
+        try:
+            connection.execute("DELETE FROM account_web_sessions")
             connection.commit()
         finally:
             connection.close()
@@ -549,6 +699,30 @@ class AccountStore:
                 "DELETE FROM entry_tags WHERE account_id=? AND repo_type=? AND repo_id=?",
                 (account_id, repo_type, repo_id),
             )
+            connection.execute("DELETE FROM tags WHERE NOT EXISTS (SELECT 1 FROM entry_tags WHERE entry_tags.tag_name=tags.name)")
+            connection.commit()
+        finally:
+            connection.close()
+
+    def remove_entry_prefixes(self, account_id: str, repo_type: str, repo_id: str, prefixes) -> None:
+        normalized = list(dict.fromkeys(str(path).replace("\\", "/").strip("/") for path in prefixes if path))
+        if not normalized:
+            return
+        connection = self._connect()
+        try:
+            for prefix in normalized:
+                escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                parameters = (account_id, repo_type, repo_id, prefix, escaped + "/%")
+                connection.execute(
+                    """DELETE FROM entries WHERE account_id=? AND repo_type=? AND repo_id=?
+                       AND (path=? OR path LIKE ? ESCAPE '\\')""",
+                    parameters,
+                )
+                connection.execute(
+                    """DELETE FROM entry_tags WHERE account_id=? AND repo_type=? AND repo_id=?
+                       AND (path=? OR path LIKE ? ESCAPE '\\')""",
+                    parameters,
+                )
             connection.execute("DELETE FROM tags WHERE NOT EXISTS (SELECT 1 FROM entry_tags WHERE entry_tags.tag_name=tags.name)")
             connection.commit()
         finally:

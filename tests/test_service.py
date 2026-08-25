@@ -3,8 +3,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import requests
+
 from modelscope_manager.service import (
     ModelScopeService,
+    ModelScopeWebService,
     RemoteEntry,
     Repository,
     normalize_remote_path,
@@ -69,6 +72,25 @@ class UploadTests(unittest.TestCase):
 
 
 class RepositoryTests(unittest.TestCase):
+    def test_web_service_uses_saved_browser_session_without_exposing_it_as_token(self):
+        from modelscope_manager.web_session import ModelScopeWebSession
+
+        session = ModelScopeWebSession("web-session", "csrf-session", "csrf-token%3D")
+        service = ModelScopeWebService(session)
+
+        self.assertEqual(service.token, "")
+        self.assertEqual(service.web_session, session)
+        for client in (service.api.legacy, service.api.openapi):
+            self.assertEqual(client._session.cookies.get("csrf_session"), "csrf-session")
+            prepared = requests.Request("POST", "https://www.modelscope.cn/api/v1/test").prepare()
+            client._session.auth(prepared)
+            self.assertEqual(prepared.headers["X-CSRF-TOKEN"], "csrf-token=")
+            foreign = requests.Request("PUT", "https://example.com/blob").prepare()
+            client._session.auth(foreign)
+            self.assertNotIn("X-CSRF-TOKEN", foreign.headers)
+        with self.assertRaisesRegex(RuntimeError, "Token"):
+            service.upload_file_as(Repository("alice/demo", "dataset"), Path("a.txt"), "a.txt")
+
     def test_repository_page_size_does_not_exceed_api_limit(self):
         service = ModelScopeService.__new__(ModelScopeService)
         service.user = type("User", (), {"username": "alice"})()

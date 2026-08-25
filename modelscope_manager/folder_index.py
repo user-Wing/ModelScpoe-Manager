@@ -129,6 +129,56 @@ class FolderSizeIndex:
                 connection.close()
             self._cache.pop(key, None)
 
+    def remove_entries(
+        self,
+        repo: Repository,
+        entries: Iterable[RemoteEntry],
+        removed_prefixes: Iterable[str] = (),
+        public: bool = False,
+    ) -> None:
+        decrements: dict[str, int] = {}
+        for entry in entries:
+            if entry.is_dir:
+                continue
+            size = max(0, int(entry.size))
+            decrements[""] = decrements.get("", 0) + size
+            parent = PurePosixPath(entry.path).parent
+            while str(parent) not in {"", "."}:
+                path = str(parent)
+                decrements[path] = decrements.get(path, 0) + size
+                parent = parent.parent
+        prefixes = list(dict.fromkeys(path.strip("/") for path in removed_prefixes if path.strip("/")))
+        key = (bool(public), repo.repo_type, repo.repo_id)
+        with self._lock:
+            connection = self._connect()
+            try:
+                connection.executemany(
+                    """UPDATE folder_sizes SET total_size=MAX(0, total_size-?), indexed_at=?
+                       WHERE public=? AND repo_type=? AND repo_id=? AND folder_path=?""",
+                    [
+                        (size, int(time.time()), int(public), repo.repo_type, repo.repo_id, path)
+                        for path, size in decrements.items()
+                    ],
+                )
+                for prefix in prefixes:
+                    escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                    connection.execute(
+                        """DELETE FROM folder_sizes WHERE public=? AND repo_type=? AND repo_id=?
+                           AND (folder_path=? OR folder_path LIKE ? ESCAPE '\\')""",
+                        (int(public), repo.repo_type, repo.repo_id, prefix, escaped + "/%"),
+                    )
+                connection.commit()
+            finally:
+                connection.close()
+            sizes = self._cache.get(key)
+            if sizes is not None:
+                for path, size in decrements.items():
+                    if path in sizes:
+                        sizes[path] = max(0, sizes[path] - size)
+                for prefix in prefixes:
+                    for path in [value for value in sizes if value == prefix or value.startswith(prefix + "/")]:
+                        sizes.pop(path, None)
+
     def folder_size(self, repo: Repository, folder_path: str = "", public: bool = False) -> int:
         return self.cached_folder_size(repo, folder_path, public) or 0
 

@@ -4,8 +4,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from modelscope_manager.database import AccountRecord, AccountStore, classify_file, initialize_database
+from modelscope_manager.database import (
+    AccountRecord, AccountStore, WebAccountRecord, classify_file, initialize_database,
+)
 from modelscope_manager.service import ModelScopeService, MultiAccountService, RemoteEntry, Repository
+from modelscope_manager.web_session import ModelScopeWebSession
 
 
 class DatabaseTests(unittest.TestCase):
@@ -88,6 +91,63 @@ class DatabaseTests(unittest.TestCase):
                 connection.close()
             self.assertEqual((cipher, bound_id), ("", ""))
 
+    def test_web_session_is_encrypted_device_bound_and_independent_from_token_account(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "manager.sqlite3"
+            initialize_database(path)
+            session = ModelScopeWebSession("web-session", "csrf-session", "csrf-token%3D")
+            with patch(
+                "modelscope_manager.database.protect",
+                side_effect=lambda value: "encrypted:" + value.encode("utf-8").hex(),
+            ), patch(
+                "modelscope_manager.database.unprotect",
+                side_effect=lambda value: bytes.fromhex(value.removeprefix("encrypted:")).decode("utf-8"),
+            ):
+                store = AccountStore(path, "device-a")
+                account = store.save(AccountRecord("", "Main", "alice", "token", True))
+                store.save_web_session(account.account_id, session)
+                self.assertEqual(store.load_web_session(account.account_id), session)
+                self.assertNotIn("web-session", path.read_bytes().decode("latin1", errors="ignore"))
+                self.assertIsNone(AccountStore(path, "device-b").load_web_session(account.account_id))
+
+                store.save_web_session(account.account_id, session)
+                store.remove(account.account_id)
+                self.assertEqual(store.load_web_session(account.account_id), session)
+
+    def test_existing_attached_web_session_migrates_to_independent_web_account(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "manager.sqlite3"
+            initialize_database(path)
+            store = AccountStore(path, "device-a")
+            token_account = store.save(AccountRecord("", "Legacy", "alice", "token", True))
+            session = ModelScopeWebSession("web", "csrf-session", "csrf-token")
+            store.save_web_session(token_account.account_id, session)
+
+            initialize_database(path)
+            web_accounts = store.list_web_accounts()
+
+            self.assertEqual(
+                web_accounts,
+                [WebAccountRecord(token_account.account_id, "Legacy", "alice", "connected")],
+            )
+            self.assertEqual(store.load_web_session(web_accounts[0].account_id), session)
+
+    def test_web_accounts_are_independent_and_removal_destroys_only_their_session(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "manager.sqlite3"
+            initialize_database(path)
+            store = AccountStore(path, "device-a")
+            token_account = store.save(AccountRecord("", "Token", "alice", "token", True))
+            web_account = store.save_web_account(WebAccountRecord("", "Web", "alice"))
+            session = ModelScopeWebSession("web", "csrf-session", "csrf-token")
+            store.save_web_session(web_account.account_id, session)
+
+            store.remove_web_account(web_account.account_id)
+
+            self.assertEqual(store.list_accounts()[0].account_id, token_account.account_id)
+            self.assertEqual(store.list_web_accounts(), [])
+            self.assertIsNone(store.load_web_session(web_account.account_id))
+
     def test_entry_index_supports_name_type_and_repository_scope(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "manager.sqlite3"
@@ -105,6 +165,28 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(len(store.search_entries(account_id="other")), 0)
             self.assertEqual(len(store.repository_entries("account-a", "dataset", "alice/media")), 3)
             self.assertEqual(classify_file("bundle.tar.gz"), (".tar.gz", "archive"))
+
+    def test_remove_entry_prefixes_updates_only_the_selected_subtree(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "manager.sqlite3"
+            initialize_database(path)
+            store = AccountStore(path, "device")
+            repo = Repository("alice/demo", "dataset")
+            store.cache_entries("account", repo, [
+                RemoteEntry("folder/a.txt", 1),
+                RemoteEntry("folder/deep/b.txt", 2),
+                RemoteEntry("folder_escaped/keep.txt", 3),
+                RemoteEntry("other.txt", 4),
+            ])
+            store.set_entry_tags("account", "dataset", "alice/demo", "folder/a.txt", ["remove"])
+
+            store.remove_entry_prefixes("account", "dataset", "alice/demo", ["folder"])
+
+            self.assertEqual(
+                [entry.path for entry in store.repository_entries("account", "dataset", "alice/demo")],
+                ["folder_escaped/keep.txt", "other.txt"],
+            )
+            self.assertEqual(store.all_tags(), [])
 
     def test_search_returns_all_files_and_matches_every_term(self):
         with tempfile.TemporaryDirectory() as temporary:

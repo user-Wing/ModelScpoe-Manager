@@ -107,7 +107,7 @@ QMenu::item { padding: 7px 24px; border-radius: 4px; }
 QMenu::item:selected { background: #174d73; }
 QFrame#dropArea { background: #223442; border: 2px dashed #4c8fbe; border-radius: 10px; }
 QFrame#dropArea[dragging="true"] { background: #1a465f; border-color: #63b5ed; }
-QProgressBar { border: 1px solid #555b65; background: #30333a; border-radius: 5px; min-height: 18px; max-height: 18px; text-align: center; color: #f2f2f2; font-weight: 600; }
+QProgressBar { border: 1px solid #555b65; background: #30333a; border-radius: 5px; min-height: 18px; max-height: 18px; text-align: center; color: #ffffff; font-weight: 600; }
 QProgressBar::chunk { background: #277db8; border-radius: 4px; }
 QCheckBox { spacing: 7px; }
 QCheckBox::indicator { width: 17px; height: 17px; background: #202226; border: 1px solid #a0a5ad; border-radius: 3px; }

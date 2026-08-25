@@ -9,6 +9,10 @@ class ThemeStyleTests(unittest.TestCase):
         self.assertIn("QTimeEdit", theme_qss(True))
         self.assertNotEqual(theme_qss(False), theme_qss(True))
 
+    def test_dark_progress_text_uses_high_contrast_white(self):
+        self.assertIn("QProgressBar", theme_qss(True))
+        self.assertIn("color: #ffffff", theme_qss(True))
+
     def test_acrylic_theme_keeps_qt_top_level_opaque(self):
         self.assertNotIn("rgba(243,243,243,218)", theme_qss(False, True))
         self.assertNotIn("rgba(32,33,36,218)", theme_qss(True, True))

@@ -191,4 +191,6 @@ class CleanComboBox(ComboBox):
             position.setY(min(position.y(), available.bottom() - menu.height() + 1))
         else:
             position.setY(max(available.top() + menu.height(), position.y()))
-        menu.exec(position, aniType=animation)
+        menu.closedSignal.connect(lambda: self.window().update())
+        menu.view.adjustSize(position, MenuAnimationType.NONE)
+        menu.exec(position, ani=False, aniType=MenuAnimationType.NONE)

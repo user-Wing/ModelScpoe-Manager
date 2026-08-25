@@ -43,16 +43,17 @@ GUI 的耗时工作通过 `QThread` 子类执行，主线程只负责界面、�
 | `start.bat` | Windows 便携启动脚本；切换到程序目录并优先调用内置 `runtime\pythonw.exe`。 |
 | `THIRD_PARTY_NOTICES.md` | Python、PySide6、ModelScope SDK、aria2-next、7-Zip-zstd 等第三方许可和来源说明。 |
 | `V1.0.2更新日志.md` | V1.0.2 面向用户的简要功能、修复与使用说明。 |
+| `V1.0.3更新日志.md` | V1.0.3 面向用户的简要功能、修复与安全说明。 |
 | `project.md` | 本项目结构、约束、验证方式和更新日志；每次源码修改后追加摘要。 |
 
 ### 3.2 `modelscope_manager` Python 包（按文件名排序）
 
 | 文件 | 代码功能与边界 |
 |---|---|
-| `__init__.py` | 包标识和版本号，目前为 `1.0.2`。 |
-| `app.py` | 主应用编排层。创建 FluentWindow、导航页、账户/仓库树（含只读 Public）、标签筛选、公开资源历史、可追加的上传队列、下载队列、备份、图床、播放器设置、托盘和 WebDAV 控制；定义后台线程。上传项保存独立目标路径，当前项可在 SDK 字节回调边界暂停、恢复或取消。 |
+| `__init__.py` | 包标识和版本号，目前为 `1.0.3`。 |
+| `app.py` | 主应用编排层。创建 FluentWindow、导航页、Public/Token/网页登录账户仓库树、标签筛选、公开资源历史、可追加的上传队列、下载队列、备份、图床、播放器设置、托盘和 WebDAV 控制；定义后台线程。上传项保存独立目标路径，当前项可在 SDK 字节回调边界暂停、恢复或取消；网页登录仓库的删除、移动和重命名仍把上传阶段路由到 Token SDK。 |
 | `backup.py` | 备份任务数据模型和 SQLite 存储。按文件大小/修改时间识别新增或变更文件，支持增量时间戳目录、同路径覆盖所需的记录、周期到期判断和云端同步时间记录；单文件达到 50 GiB 时列为跳过项。 |
-| `database.py` | 主 SQLite 数据层。保存账户元数据及设备绑定加密 Token、仓库缓存、远端条目、搜索索引、目录大小、备份任务/文件、图床记录和多标签映射；重新缓存仓库条目时会清理已消失路径的标签。 |
+| `database.py` | 主 SQLite 数据层。保存账户元数据及设备绑定加密 Token/网页登录会话、仓库缓存、远端条目、搜索索引、目录大小、备份任务/文件、图床记录和多标签映射；重新缓存仓库条目时会清理已消失路径的标签。 |
 | `download_service.py` | aria2-next 下载适配层。定义下载规格和 `Aria2Tuning`，校验远端路径，生成 manifest，启动/连接 aria2 RPC，执行暂停/恢复/停止、动态下载限速、进度汇总和 SHA-256 校验；本地文件保留断点与已下载内容。 |
 | `folder_index.py` | 递归远端条目的目录大小计算与持久化缓存。把每个文件累加到根目录及所有祖先目录，供 GUI 和 WebDAV 复用；GUI 仅显示上次缓存值，缺少缓存时显示 `--`，索引任务完成后刷新为最新值。 |
 | `fluent_ui.py` | PySide6-Fluent-Widgets UI 薄封装：任意右侧控件设置卡片、复杂设置面板卡片、QCheckBox 兼容开关和无原生阴影且按屏幕边界定位的下拉框。 |
@@ -64,11 +65,12 @@ GUI 的耗时工作通过 `QThread` 子类执行，主线程只负责界面、�
 | `player_installer.py` | PotPlayer 归档安全安装。固定归档大小和 SHA-256，使用内置 7z-zstd 解压到 staging，验证可执行文件后事务式替换旧目录并失败回滚。 |
 | `public_pools.py` | 公共资源池历史。以原子替换方式保存资源搜索成功加载过的公开仓库，支持单项移除和清空，重启后恢复 WebDAV `public` 挂载。 |
 | `security.py` | Windows DPAPI 的 ctypes 封装，提供 `protect`/`unprotect`；只处理 Token 字符串，不在日志中输出凭据。 |
-| `service.py` | ModelScope SDK 适配边界。定义 `Repository`、`RemoteEntry`，解析官方公开链接，规范化远端路径，列出账户仓库和文件，获取直链，上传文件/文件夹并桥接进度；`MultiAccountService` 按仓库路由到已验证账户。数据集文件必须优先使用 SDK 的 `list_dataset_files_paginated`，仓库 API `page_size` 上限为 50。 |
+| `service.py` | ModelScope SDK 适配边界。定义 `Repository`、`RemoteEntry`，解析官方公开链接，规范化远端路径，列出账户仓库和文件，获取直链，上传文件/文件夹并桥接进度；`ModelScopeWebService` 只复用网页登录会话做读取/下载并显式拒绝上传，`MultiAccountService` 按仓库路由到已验证账户。数据集文件必须优先使用 SDK 的 `list_dataset_files_paginated`，仓库 API `page_size` 上限为 50。 |
 | `startup.py` | Windows 当前用户开机自启注册表读写，生成指向便携目录 `main.py` 的 `pythonw.exe` 启动命令。 |
 | `storage.py` | 便携配置与设备身份。使用程序目录 `data` 下的 `settings.ini`、`device.id` 等文件；设备标识变化时清除无法解开的旧 Token，保存 Token 时与设备标识绑定。 |
 | `styles.py` | 浅色/深色 PySide6 QSS，包括侧栏、卡片、树/表格、拖放区、按钮、进度条、`QTimeEdit` 和紧凑视图基础样式。 |
 | `transfer_policy.py` | 上传/下载共享限速策略。支持默认速率、每日分时规则、跨午夜时间段和重叠规则最后一条覆盖；`SharedRateLimiter` 为上传 SDK 流和其他共享上传任务提供进程级聚合限速。 |
+| `web_session.py` | ModelScope 网页登录最小会话模型、当前网页用户名解析，以及模型/数据集单文件删除请求；请求不记录 Cookie 或 CSRF 值。 |
 | `webdav_server.py` | 只使用 Python 标准库实现的 WebDAV 网关。虚拟挂载 `models`、`datasets`、`public`，支持 Basic Auth、目录列举、远程读取和上传；公共池只读，ModelScope 当前不支持的删除/移动/复制操作会拒绝。目录属性使用 `FolderSizeIndex`。 |
 | `assets/check.svg` | QSS 勾选框图标资源。 |
 
@@ -116,7 +118,7 @@ GUI 的耗时工作通过 `QThread` 子类执行，主线程只负责界面、�
 - Token 必须经过 DPAPI 且绑定设备；禁止把 Token 写入日志、播放器命令行或跨主机重定向请求。
 - 私有媒体代理只监听回环地址，不缓存媒体；Range、响应头和跨主机重定向行为属于安全边界。
 - 上传限速是进程级聚合限制，不能退化为每文件限速；下载限速通过 aria2 全局设置动态更新。
-- ModelScope Token API 当前不提供可靠删除能力；WebDAV 删除、移动、复制应保持拒绝，网页端删除入口除外。
+- ModelScope Token API 当前不提供可靠删除能力；程序内删除使用独立 DPAPI 设备绑定的网页登录会话。所有上传和秒传提交仍必须走有目标仓库权限的 Token SDK，禁止回退到网页上传；WebDAV 删除、移动、复制继续保持拒绝。
 - PotPlayer 安装必须先做固定大小和 SHA-256 校验，采用 staging/backup 回滚；成功后才删除归档。
 - `runtime`、`data`、归档和缓存属于部署/运行状态，不应在普通源码修改中批量清理或覆盖。
 - 本目录已完成 `git init`。执行环境与目录所有者不同，自动化检查 Git 状态时使用仅本命令生效的 `-c safe.directory=<本目录>`，不要因此改写用户的全局 Git 配置。
@@ -137,6 +139,47 @@ runtime\python.exe -s -m compileall -q main.py modelscope_manager tests
 每次修改源码、测试、部署脚本或用户可见行为后，在本文“更新日志”最前面追加一条：日期、修改文件、行为摘要、验证结果和剩余风险。若只做分析或未改文件，不追加虚假记录。修改 `README.md` 或依赖版本时，也应说明是否同步检查本文件中的约束。
 
 ## 7. 更新日志
+
+### 2026-08-25 — V1.0.3 源码发布准备
+
+- `modelscope_manager/__init__.py`、`modelscope_manager/app.py`、`README.md`：版本更新为 `1.0.3`，状态栏与源码说明同步显示新版本。
+- `V1.0.3更新日志.md`、`project.md`：汇总多网页登录账户、程序内批量删除、移动与区分大小写重命名、索引增量更新及本轮 Fluent UI 修复，并明确网页登录凭据与 Token SDK 的安全边界。
+- 发布边界：GitHub 仅提交源码、测试与文档；现有 `.gitignore` 继续排除 `data/`、`runtime/`、`dist/`、Python 字节码和上传缓存，不清除或上传本机已保存的 Token、Cookie、数据库及其他账户数据。
+- 验证：全量 108 项单元测试通过，`runtime\python.exe -s -m compileall -q main.py modelscope_manager tests`、版本导入冒烟与 `git diff --check` 通过。
+- 风险：本次只发布源码，不创建 GitHub Release 或便携压缩包；全量测试仍会输出既有的临时数据库异步搜索 `no such table: entries` 清理竞态堆栈，但测试最终结果为 `OK`。
+
+### 2026-08-25 — 深色传输状态与 Fluent 设置布局修复
+
+- `modelscope_manager/app.py`、`modelscope_manager/styles.py`：深色模式的上传进度条文字固定为高对比白色，上传队列中等待、上传中和暂停百分比显式使用当前主题文本色，主题切换后立即重绘队列。Token 登录与第三方播放器的 `+/-` 移到对应标题同行并顶部对齐；账户连接状态与在线登录分割线之间增加 12px 留白；“下载与传输”及 aria2 详细配置的纵向间距统一增至 14px。
+- `modelscope_manager/fluent_ui.py`：设置页 `CleanComboBox` 保留透明圆角和无原生阴影，但改用无动画菜单并在关闭时请求所属窗口重绘，避免透明顶层展开动画留下旧帧残影。
+- `tests/test_app_helpers.py`、`tests/test_fluent_ui.py`、`tests/test_styles.py`：覆盖标题按钮几何对齐、分割线留白、下载面板间距、深色上传状态前景色、无动画下拉菜单和深色进度文字。
+- 验证：相关 31 项及全量 108 项单元测试通过，`compileall` 与 `git diff --check` 通过；深色模式真实启动程序，逐项展开账号、下载与传输、媒体播放器设置，并连续打开/关闭主题下拉菜单，未观察到残影，布局与间距符合预期。程序验证后保持打开，未清除 Token、Cookie 或账户数据。
+- 风险：下拉设置取消展开动画以优先保证稳定重绘，交互会立即显示而不再具有下拉位移动画；其他非设置页原生 `QComboBox` 不使用该封装，行为保持不变。
+
+### 2026-08-25 — 文件夹批量删除与索引增量更新
+
+- `modelscope_manager/web_session.py`、`modelscope_manager/app.py`：文件夹删除从逐文件独立请求改为每批最多 100 条 `delete` action 的单次提交。批量请求异常时使用带 `Root` 和分页参数的目标目录查询识别服务端已实际删除的文件，仅对仍存在路径回退单文件删除，避免响应超时造成“网页已消失、软件仍报失败”的误判。
+- `modelscope_manager/database.py`、`modelscope_manager/folder_index.py`：新增按路径前缀删除条目/标签的 SQLite 事务，以及按已删文件大小递减祖先目录、移除目录子树的大小索引更新；删除完成后的界面刷新不再调用全仓 `cache_entries()` 或重写全部 `folder_sizes`。
+- `tests/test_web_session.py`、`tests/test_app_helpers.py`、`tests/test_database.py`、`tests/test_folder_index.py`、`README.md`：覆盖批量提交、目录分页查询、不确定提交对账、相似路径隔离、标签清理和目录大小增量更新，并同步删除行为说明。
+- 验证：相关 45 项及全量 107 项单元测试通过，`compileall` 与 `git diff --check` 通过。真实远端两轮均在 `ARXChem/Animations-List/test` 下由 Token SDK 上传 3 个小文件，再由网页登录会话单次批量删除；第二轮使用生产 `DeleteThread` 删除 `test/manager-delete-fa582de0`，结果为 3 个成功、0 个失败，目录级查询剩余 0 个。
+- 风险：超过 100 个文件的目录仍需多次批量提交，后续批次失败时前面已完成的提交不可回滚；若批量请求和随后的目录查询同时发生网络故障，会回退逐文件请求并保留真实失败项。全量测试中既有的临时数据库搜索回调 `no such table: entries` 清理竞态仍可能输出，但不影响测试最终结果。
+
+### 2026-08-25 — 多网页登录账户与程序内删除、移动、重命名
+
+- `modelscope_manager/database.py`、`modelscope_manager/app.py`：新增独立 `web_accounts` 多账户表和设置页表格，支持 `+` 添加、账户名称编辑、逐行在线登录与“成功”状态。旧版附着于 Token 账户的加密会话会原样登记为独立网页登录账户；Token 账户移除不再连带删除该网页登录会话，Cookie/Token 数据未在本次更新中清空。
+- `modelscope_manager/app.py`：仓库树分成 Public、Token 登录账户和网页登录账户三段。资源菜单统一显示删除、移动、`重命名（区分大小写）`；Public 和 Token 下对应动作置灰并提供只读/改用在线登录提示。删除文件夹时逐个删除其全部文件，成功后只更新本地仓库条目、文件夹大小和当前视图，不重新请求整个远端树。
+- `modelscope_manager/service.py`、`modelscope_manager/web_session.py`：网页登录会话可驱动账户校验、仓库列举、分页读取和安全下载；网页服务的上传方法显式拒绝。复制、移动、重命名和普通上传都按目标仓库重新选择 Token SDK 服务；移动/重命名先经过复制阈值判断，下载到临时目录，只有全部目标上传成功后才调用网页删除旧路径。
+- `tests/test_app_helpers.py`、`tests/test_database.py`、`tests/test_service.py`、`tests/test_web_session.py`、`README.md`：覆盖旧会话迁移、网页登录账户独立生命周期、同主机 CSRF 注入与第三方主机隔离、网页上传拒绝、递归路径映射、上传失败不删除源文件和模型/数据集删除端点，并同步用户说明。
+- 验证：全量单元测试通过（102 tests），`compileall` 与 `git diff --check` 通过。真实远端在 `ARXChem/Animations-List/Violet Evergarden` 选取 128 字节的 `Disc/Soundtracks/LACA-9751~3/CD/Scan/!CREDIT.txt`：Token SDK 上传后网页会话删除旧路径，依次完成移动到临时目录、区分大小写重命名为 `CASE_TEST_!CREDIT.txt`、再移动回原路径；三次均为上传零失败后删除一个源文件，最终原路径存在、临时前缀为空、目标前缀普通文件仍为 9 个。
+- 风险：网页登录会话仍可能由服务端过期或撤销；没有能访问目标仓库的 Token 账户时，上传、复制目标写入、移动和重命名会停止并提示，不会尝试网页上传。多文件删除在服务端逐项提交，若网络中途失败，已删除项不可回滚，界面会保留失败项并报告成功/失败数。全量测试仍会输出既有的临时数据库搜索回调 `no such table: entries`，测试结果为 `OK`。
+
+### 2026-08-25 — ModelScope 在线登录会话捕获与删除链路验证
+
+- `modelscope_manager/app.py`、`modelscope_manager/web_session.py`：账号设置区分“Token 登录”和“ModelScope 账户 在线登录”；内置 Qt WebEngine 使用非持久化配置打开官方登录页，只捕获 `m_session_id`、`csrf_session`、`csrf_token`，校验网页登录后交给账号存储。修复 Qt `QNetworkCookie.domain()` 返回 `str` 而名称和值返回 `QByteArray` 时会话捕获静默失败的问题。
+- `modelscope_manager/database.py`：新增账户网页登录会话表；会话 JSON 使用 Windows DPAPI 加密并绑定当前设备，移除账户或设备身份失效时同步销毁。
+- `tests/test_app_helpers.py`、`tests/test_database.py`、`tests/test_web_session.py`、`README.md`：覆盖真实 Qt Cookie 类型、会话加密/设备绑定/清理、CSRF 请求头、网页登录校验和删除请求，并同步说明在线登录的安全边界。
+- 验证：全量单元测试通过（95 tests），`compileall` 通过；真实登录信息成功保存并重载，使用网页会话删除 `ARXChem/Animations-List` 中 124 字节的 `Violet Evergarden/Disc/Scans/The Movie/Theater Goods/Postcard from Ecartehiga/Text.txt`，接口返回 `Code=200`，SDK 重新分页列举确认该路径消失、目标前缀普通文件由 10 个变为 9 个。测试过程中未输出 Token、Cookie 或 CSRF 值。
+- 风险：网页登录会话可能被 ModelScope 服务端过期或撤销，需要用户重新在线登录；Qt WebEngine 增加便携运行时体积。当前完成的是安全会话捕获、保存和底层删除能力，资源菜单中的程序内删除入口仍需单独接入确认交互；WebDAV 的删除/移动/复制继续保持拒绝。
 
 ### 2026-08-24 — V1.0.2 便携构建与发布准备
 

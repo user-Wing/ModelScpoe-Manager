@@ -3,10 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Iterable
-from urllib.parse import unquote, urlparse
+from typing import TYPE_CHECKING, Any, Callable, Iterable
+from urllib.parse import unquote, urlparse, urlsplit
+
+import requests
+from requests.auth import AuthBase
 
 from .transfer_policy import SharedRateLimiter
+
+if TYPE_CHECKING:
+    from .web_session import ModelScopeWebSession
 
 
 SUPPORTED_REPO_TYPES = ("model", "dataset")
@@ -254,6 +260,16 @@ class ModelScopeService:
             "master",
         )
 
+    def download_to_file(self, repo: Repository, remote_path: str, target: Path) -> None:
+        url = self.get_download_url(repo, remote_path)
+        headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
+        with requests.get(url, headers=headers, stream=True, timeout=30) as response:
+            response.raise_for_status()
+            with target.open("wb") as output:
+                for chunk in response.iter_content(1024 * 1024):
+                    if chunk:
+                        output.write(chunk)
+
     @contextmanager
     def track_upload_progress(self, callback: Callable[[int], None]):
         """Temporarily bridge the bundled SDK's byte counter to the GUI."""
@@ -306,6 +322,62 @@ class ModelScopeService:
             ignore_patterns=ignore_patterns,
             disable_tqdm=True,
         )
+
+
+class _ModelScopeCsrfAuth(AuthBase):
+    def __init__(self, csrf_token: str):
+        self.csrf_token = unquote(csrf_token)
+
+    def __call__(self, request):
+        host = (urlsplit(request.url).hostname or "").lower()
+        if host == "modelscope.cn" or host.endswith(".modelscope.cn"):
+            request.headers["X-CSRF-TOKEN"] = self.csrf_token
+            request.headers.setdefault("Origin", "https://www.modelscope.cn")
+        return request
+
+
+class ModelScopeWebService(ModelScopeService):
+    """Use a saved browser session through the SDK without exposing it as a Token."""
+
+    def __init__(self, web_session: "ModelScopeWebSession"):
+        from modelscope_hub import HubApi
+
+        self.web_session = web_session
+        self.api = HubApi(token=web_session.m_session_id)
+        self.token = ""
+        self.user: Any | None = None
+        for client in (self.api.legacy, self.api.openapi):
+            for name, value in web_session.cookies().items():
+                client._session.cookies.set(name, value, domain=".modelscope.cn", path="/")
+            client._session.auth = _ModelScopeCsrfAuth(web_session.csrf_token)
+
+    def download_to_file(self, repo: Repository, remote_path: str, target: Path) -> None:
+        session = requests.Session()
+        for name, value in self.web_session.cookies().items():
+            session.cookies.set(name, value, domain=".modelscope.cn", path="/")
+        session.auth = _ModelScopeCsrfAuth(self.web_session.csrf_token)
+        with session.get(self.get_download_url(repo, remote_path), stream=True, timeout=30) as response:
+            response.raise_for_status()
+            with target.open("wb") as output:
+                for chunk in response.iter_content(1024 * 1024):
+                    if chunk:
+                        output.write(chunk)
+
+    def upload_file_as(self, repo: Repository, local_path: Path, remote_path: str) -> Any:
+        raise RuntimeError("网页登录账户不用于上传，请添加可访问该仓库的 Token 账户")
+
+    def upload_file(self, repo: Repository, local_path: Path, target_folder: str) -> Any:
+        raise RuntimeError("网页登录账户不用于上传，请添加可访问该仓库的 Token 账户")
+
+    def upload_folder(
+        self,
+        repo: Repository,
+        local_path: Path,
+        target_folder: str,
+        keep_folder_name: bool = True,
+        ignore_patterns: list[str] | None = None,
+    ) -> Any:
+        raise RuntimeError("网页登录账户不用于上传，请添加可访问该仓库的 Token 账户")
 
 
 class MultiAccountService:

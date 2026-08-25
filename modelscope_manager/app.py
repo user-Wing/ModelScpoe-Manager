@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import posixpath
 import re
 import secrets
 import shutil
@@ -69,6 +70,8 @@ from PySide6.QtWidgets import (
     QWidget,
     QWidgetAction,
 )
+from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
+from PySide6.QtWebEngineWidgets import QWebEngineView
 from qfluentwidgets import (
     FluentIcon as FIF,
     FluentWindow,
@@ -86,7 +89,7 @@ from .security import protect, unprotect
 from .download_service import Aria2DownloadRunner, Aria2Tuning, DownloadSpec, build_download_specs
 from .backup import BackupJob, BackupStore, LocalBackupFile
 from .database import (
-    AccountRecord, AccountStore, IndexedEntry, classify_file,
+    AccountRecord, AccountStore, IndexedEntry, WebAccountRecord, classify_file,
     everything_search_match, initialize_database,
 )
 from .folder_index import FolderSizeIndex
@@ -105,6 +108,7 @@ from .player_installer import (
 from .public_pools import PublicPoolStore
 from .service import (
     ModelScopeService,
+    ModelScopeWebService,
     MultiAccountService,
     RemoteEntry,
     Repository,
@@ -134,6 +138,10 @@ from .storage import (
 from .startup import set_windows_startup, windows_startup_enabled
 from .transfer_policy import SpeedRule, TransferPolicy
 from .webdav_server import ModelScopeWebDAV
+from .web_session import (
+    DELETE_BATCH_SIZE, ModelScopeWebSession, delete_repository_file, delete_repository_files,
+    fetch_web_user_info, list_repository_file_paths, web_session_username,
+)
 
 
 MEDIA_EXTENSIONS = {
@@ -485,11 +493,14 @@ class CopyThread(QThread):
                 local = temporary / (base if self.selected.is_dir else "") / relative
                 local.parent.mkdir(parents=True, exist_ok=True)
                 try:
-                    headers = {"Authorization": f"Bearer {self.source_service.token}"} if self.source_service.token else {}
-                    request = Request(self.source_service.get_download_url(self.source_repo, entry.path), headers=headers)
-                    with urlopen(request, timeout=30) as response, local.open("wb") as output:
-                        while chunk := response.read(1024 * 1024):
-                            output.write(chunk)
+                    if hasattr(self.source_service, "download_to_file"):
+                        self.source_service.download_to_file(self.source_repo, entry.path, local)
+                    else:
+                        headers = {"Authorization": f"Bearer {self.source_service.token}"} if self.source_service.token else {}
+                        request = Request(self.source_service.get_download_url(self.source_repo, entry.path), headers=headers)
+                        with urlopen(request, timeout=30) as response, local.open("wb") as output:
+                            while chunk := response.read(1024 * 1024):
+                                output.write(chunk)
                     target = normalize_remote_path(self.destination_folder, base if self.selected.is_dir else "", relative)
                     self.destination_service.upload_file_as(self.destination_repo, local, target)
                 except Exception:
@@ -502,6 +513,99 @@ class CopyThread(QThread):
         finally:
             shutil.rmtree(temporary, ignore_errors=True)
         self.completed.emit(ok, failed)
+
+
+class DeleteThread(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, session, repo, paths, parent=None):
+        super().__init__(parent)
+        self.session, self.repo, self.paths = session, repo, list(paths)
+
+    def run(self) -> None:
+        deleted: list[str] = []
+        failures: dict[str, str] = {}
+        for offset in range(0, len(self.paths), DELETE_BATCH_SIZE):
+            batch = self.paths[offset:offset + DELETE_BATCH_SIZE]
+            try:
+                delete_repository_files(self.session, self.repo.repo_id, self.repo.repo_type, batch)
+            except Exception as exc:
+                root = posixpath.commonpath(batch)
+                if root in batch:
+                    root = str(PurePosixPath(root).parent)
+                try:
+                    present = set(list_repository_file_paths(
+                        self.session, self.repo.repo_id, self.repo.repo_type, "" if root == "." else root,
+                    ))
+                except Exception:
+                    present = set(batch)
+                missing = [path for path in batch if path not in present]
+                deleted.extend(missing)
+                for path in (path for path in batch if path in present):
+                    try:
+                        delete_repository_file(self.session, self.repo.repo_id, self.repo.repo_type, path)
+                    except Exception as item_exc:
+                        failures[path] = str(item_exc or exc)
+                    else:
+                        deleted.append(path)
+            else:
+                deleted.extend(batch)
+        self.completed.emit({"deleted": deleted, "failures": failures})
+
+
+class RelocateThread(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self, source_service, source_repo, destination_service, destination_repo,
+        mappings: dict[str, str], delete_source: Callable[[str], None], parent=None,
+    ):
+        super().__init__(parent)
+        self.source_service, self.source_repo = source_service, source_repo
+        self.destination_service, self.destination_repo = destination_service, destination_repo
+        self.mappings = dict(mappings)
+        self.delete_source = delete_source
+        self.result: dict[str, Any] = {}
+
+    def run(self) -> None:
+        temporary = Path(tempfile.mkdtemp(prefix="modelscope-relocate-"))
+        downloaded: dict[str, Path] = {}
+        upload_failed: list[str] = []
+        deleted: list[str] = []
+        delete_failed: dict[str, str] = {}
+        try:
+            for index, source in enumerate(self.mappings):
+                local = temporary / str(index) / Path(source).name
+                local.parent.mkdir(parents=True, exist_ok=True)
+                self.source_service.download_to_file(self.source_repo, source, local)
+                downloaded[source] = local
+            for source, target in self.mappings.items():
+                try:
+                    self.destination_service.upload_file_as(self.destination_repo, downloaded[source], target)
+                except Exception:
+                    upload_failed.append(source)
+            if not upload_failed:
+                for source in sorted(self.mappings, reverse=True):
+                    try:
+                        self.delete_source(source)
+                    except Exception as exc:
+                        delete_failed[source] = str(exc)
+                    else:
+                        deleted.append(source)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        finally:
+            shutil.rmtree(temporary, ignore_errors=True)
+        self.result = {
+            "mappings": self.mappings,
+            "upload_failed": upload_failed,
+            "deleted": deleted,
+            "delete_failed": delete_failed,
+        }
+        self.completed.emit(self.result)
 
 
 @dataclass
@@ -994,6 +1098,143 @@ class DropArea(QFrame):
             event.acceptProposedAction()
 
 
+class ModelScopeLoginDialog(QDialog):
+    session_captured = Signal(object, object)
+    session_url = "https://www.modelscope.cn/datasets/ARXChem/Animations-List/tree/master/Violet%20Evergarden"
+
+    def __init__(self, account_label: str, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle(f"ModelScope 在线登录 · {account_label}")
+        self.resize(1080, 760)
+        self.setMinimumSize(820, 600)
+        self._cookies: dict[str, str] = {}
+        self._preparing_session = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        toolbar = QHBoxLayout()
+        self.address = QLineEdit()
+        self.address.setReadOnly(True)
+        toolbar.addWidget(self.address, 1)
+        reload_button = QPushButton("刷新")
+        reload_button.clicked.connect(lambda: self.web_view.reload())
+        toolbar.addWidget(reload_button)
+        layout.addLayout(toolbar)
+
+        self.status_label = QLabel("请在下方 ModelScope 官方页面完成短信或账密登录。", objectName="subtitle")
+        layout.addWidget(self.status_label)
+
+        self.profile = QWebEngineProfile(self)
+        self.profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.MemoryHttpCache)
+        self.profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.NoPersistentCookies)
+        self.profile.cookieStore().cookieAdded.connect(self._cookie_added)
+        self.profile.cookieStore().cookieRemoved.connect(self._cookie_removed)
+        self.page = QWebEnginePage(self.profile, self)
+        self.web_view = QWebEngineView(self)
+        self.web_view.setPage(self.page)
+        self.web_view.urlChanged.connect(lambda url: self.address.setText(url.toString()))
+        self.web_view.loadFinished.connect(self._page_loaded)
+        layout.addWidget(self.web_view, 1)
+
+        actions = QHBoxLayout()
+        actions.addStretch()
+        cancel_button = QPushButton("取消")
+        cancel_button.clicked.connect(self.reject)
+        actions.addWidget(cancel_button)
+        self.save_button = QPushButton("保存登录信息", objectName="primary")
+        self.save_button.clicked.connect(self._save_session)
+        actions.addWidget(self.save_button)
+        layout.addLayout(actions)
+        self.web_view.setUrl(QUrl("https://www.modelscope.cn/login"))
+
+    @staticmethod
+    def _cookie_text(value) -> str:
+        if isinstance(value, str):
+            return value
+        return bytes(value).decode("utf-8", errors="ignore")
+
+    @classmethod
+    def _cookie_parts(cls, cookie) -> tuple[str, str, str]:
+        return (
+            cls._cookie_text(cookie.name()),
+            cls._cookie_text(cookie.value()),
+            cls._cookie_text(cookie.domain()).lstrip("."),
+        )
+
+    def _cookie_added(self, cookie) -> None:
+        name, value, domain = self._cookie_parts(cookie)
+        if domain == "modelscope.cn" or domain.endswith(".modelscope.cn"):
+            if name in {"m_session_id", "csrf_session", "csrf_token"}:
+                self._cookies[name] = value
+                self._update_capture_status()
+
+    def _cookie_removed(self, cookie) -> None:
+        name, value, domain = self._cookie_parts(cookie)
+        if (domain == "modelscope.cn" or domain.endswith(".modelscope.cn")) and self._cookies.get(name) == value:
+            self._cookies.pop(name, None)
+            self._update_capture_status()
+
+    def _update_capture_status(self) -> None:
+        missing = [name for name in ("m_session_id", "csrf_session", "csrf_token") if not self._cookies.get(name)]
+        if not missing:
+            self.status_label.setText("已检测到登录会话。请确认页面已登录成功，然后保存登录信息。")
+        elif self._preparing_session:
+            self.status_label.setText("正在从仓库页面取得删除凭据，尚缺少：" + "、".join(missing))
+
+    def _page_loaded(self, ok: bool) -> None:
+        if not ok or not self._preparing_session:
+            return
+        self.profile.cookieStore().loadAllCookies()
+        QTimer.singleShot(800, self._finish_preparing_session)
+
+    def _finish_preparing_session(self) -> None:
+        self._preparing_session = False
+        missing = [name for name in ("m_session_id", "csrf_session", "csrf_token") if not self._cookies.get(name)]
+        if missing:
+            self.status_label.setText("登录信息仍不完整，缺少：" + "、".join(missing))
+            QMessageBox.warning(
+                self,
+                "登录信息不完整",
+                "未能取得删除所需的网页登录信息：" + "、".join(missing) + "。请确认页面显示已登录后重试。",
+            )
+            return
+        self._validate_and_save_session()
+
+    def _save_session(self) -> None:
+        self.profile.cookieStore().loadAllCookies()
+        missing = [name for name in ("m_session_id", "csrf_session", "csrf_token") if not self._cookies.get(name)]
+        if missing:
+            if not self._cookies.get("m_session_id"):
+                QMessageBox.information(self, "尚未登录", "尚未检测到 ModelScope 登录会话，请先完成登录。")
+                return
+            self._preparing_session = True
+            self.status_label.setText("正在进入仓库页面取得删除凭据…")
+            self.web_view.setUrl(QUrl(self.session_url))
+            return
+        self._validate_and_save_session()
+
+    def _validate_and_save_session(self) -> None:
+        try:
+            session = ModelScopeWebSession(
+                self._cookies.get("m_session_id", ""),
+                self._cookies.get("csrf_session", ""),
+                self._cookies.get("csrf_token", ""),
+            )
+            self.status_label.setText("正在验证网页登录状态…")
+            QApplication.processEvents()
+            user_info = fetch_web_user_info(session)
+        except Exception as exc:
+            self.status_label.setText("尚未取得有效登录状态，请完成登录后重试。")
+            QMessageBox.warning(self, "在线登录验证失败", str(exc))
+            return
+        self.session_captured.emit(session, user_info)
+        self.accept()
+
+    def done(self, result: int) -> None:
+        self.profile.cookieStore().deleteAllCookies()
+        super().done(result)
+
+
 class MainWindow(FluentWindow):
     def __init__(self):
         self._event_filter_ready = False
@@ -1013,10 +1254,12 @@ class MainWindow(FluentWindow):
         self.public_pool_store = PublicPoolStore(PUBLIC_POOLS_PATH)
         self.folder_index = FolderSizeIndex(MANAGER_DB_PATH)
         self.accounts: list[AccountRecord] = []
+        self.web_accounts: list[WebAccountRecord] = []
         self.session_tokens: dict[str, str] = {}
         self.account_services: dict[str, ModelScopeService] = {}
         self.account_repositories: dict[str, list[Repository]] = {}
         self.active_account_id: str | None = None
+        self.active_account_kind: str | None = None
         self.service: ModelScopeService | None = None
         self.repositories: list[Repository] = []
         self.selected_repo: Repository | None = None
@@ -1044,6 +1287,10 @@ class MainWindow(FluentWindow):
         self.thumbnail_timer.timeout.connect(self._load_visible_thumbnails)
         self.copy_source: tuple[ModelScopeService, Repository, list[RemoteEntry], RemoteEntry] | None = None
         self.copy_task: CopyThread | None = None
+        self.move_source: tuple[str, ModelScopeService, Repository, list[RemoteEntry], RemoteEntry] | None = None
+        self.delete_task: DeleteThread | None = None
+        self.relocate_task: RelocateThread | None = None
+        self.relocate_context: tuple[str, Repository, str, Repository, list[RemoteEntry]] | None = None
         self.global_search_results: list[IndexedEntry] = []
         self.pending_search_path: str = ""
         self.upload_items: list[UploadQueueItem] = []
@@ -1110,7 +1357,9 @@ class MainWindow(FluentWindow):
         if self.token_destroyed_on_start:
             self.account_label.setText(self._t("检测到设备变化，已销毁已保存的访问令牌"))
             self._log("检测到设备变化，已销毁已保存的访问令牌")
-        if any(account.token for account in self.accounts):
+        if any(account.token for account in self.accounts) or any(
+            self.account_store.load_web_session(account.account_id) for account in self.web_accounts
+        ):
             QTimer.singleShot(0, self.load_repositories)
         else:
             if self.alist_auto_start.isChecked():
@@ -1127,7 +1376,7 @@ class MainWindow(FluentWindow):
         self.navigationInterface.setAcrylicEnabled(True)
         self.status_bar = QStatusBar(self)
         self.status_bar.setObjectName("fluentStatusBar")
-        self.status_bar.showMessage("ModelScope Manager 1.0.2")
+        self.status_bar.showMessage("ModelScope Manager 1.0.3")
         self.widgetLayout.removeWidget(self.stackedWidget)
         content_layout = QVBoxLayout()
         content_layout.setContentsMargins(0, 0, 0, 0)
@@ -1247,9 +1496,9 @@ class MainWindow(FluentWindow):
         self.download_selected_button.setEnabled(False)
         self.download_selected_button.clicked.connect(self._download_selected_remote)
         explorer_toolbar.addWidget(self.download_selected_button)
-        self.web_manage_button = QPushButton("网页端管理 / 删除")
+        self.web_manage_button = QPushButton("删除")
         self.web_manage_button.setEnabled(False)
-        self.web_manage_button.clicked.connect(self._open_selected_remote_web)
+        self.web_manage_button.clicked.connect(self._delete_selected_remote)
         explorer_toolbar.addWidget(self.web_manage_button)
         explorer_layout.addLayout(explorer_toolbar)
         self.resource_drop_hint = QLabel("将本地文件或文件夹拖到下方任意目录，即可直接上传到该目录", objectName="dropHint")
@@ -1476,20 +1725,22 @@ class MainWindow(FluentWindow):
         token_card = QFrame(objectName="card")
         token_layout = QVBoxLayout(token_card)
         token_layout.setContentsMargins(20, 18, 20, 20)
-        account_heading = QHBoxLayout()
-        account_heading.addWidget(QLabel("账号设置 · ModelScope 账户", objectName="section"))
-        account_heading.addStretch()
-        add_account_button = ToolButton(FIF.ADD)
-        add_account_button.setFixedSize(38, 36)
-        add_account_button.setToolTip("添加账户")
-        add_account_button.clicked.connect(self.add_account)
-        account_heading.addWidget(add_account_button)
-        remove_account_button = ToolButton(FIF.REMOVE)
-        remove_account_button.setFixedSize(38, 36)
-        remove_account_button.setToolTip("移除所选账户")
-        remove_account_button.clicked.connect(self.remove_account)
-        account_heading.addWidget(remove_account_button)
-        token_layout.addLayout(account_heading)
+        token_layout.addWidget(QLabel("账号设置 · ModelScope 账户", objectName="panelTitle"))
+        token_heading = QHBoxLayout()
+        self.token_heading_label = QLabel("Token 登录", objectName="section")
+        token_heading.addWidget(self.token_heading_label, 0, Qt.AlignmentFlag.AlignTop)
+        token_heading.addStretch()
+        self.add_account_button = ToolButton(FIF.ADD)
+        self.add_account_button.setFixedSize(38, 36)
+        self.add_account_button.setToolTip("添加账户")
+        self.add_account_button.clicked.connect(self.add_account)
+        token_heading.addWidget(self.add_account_button, 0, Qt.AlignmentFlag.AlignTop)
+        self.remove_account_button = ToolButton(FIF.REMOVE)
+        self.remove_account_button.setFixedSize(38, 36)
+        self.remove_account_button.setToolTip("移除所选账户")
+        self.remove_account_button.clicked.connect(self.remove_account)
+        token_heading.addWidget(self.remove_account_button, 0, Qt.AlignmentFlag.AlignTop)
+        token_layout.addLayout(token_heading)
         token_layout.addWidget(QLabel("Token 使用设备绑定加密；添加后会自动验证并取得用户名。", objectName="subtitle"))
         self.account_table = QTableWidget(0, 5)
         self.account_table.setHorizontalHeaderLabels(["账户名称", "用户名", "Token", "安全记住", "状态"])
@@ -1529,11 +1780,46 @@ class MainWindow(FluentWindow):
         token_layout.addWidget(self.connect_button, alignment=Qt.AlignmentFlag.AlignLeft)
         self.account_label = QLabel("尚未连接", objectName="subtitle")
         token_layout.addWidget(self.account_label)
+        token_layout.addSpacing(12)
+        self.online_separator = QFrame()
+        self.online_separator.setFrameShape(QFrame.Shape.HLine)
+        token_layout.addWidget(self.online_separator)
+        online_heading = QHBoxLayout()
+        online_heading.addWidget(QLabel("ModelScope 账户 在线登录", objectName="section"))
+        online_heading.addStretch()
+        add_web_account_button = ToolButton(FIF.ADD)
+        add_web_account_button.setFixedSize(38, 36)
+        add_web_account_button.setToolTip("添加网页登录账户")
+        add_web_account_button.clicked.connect(self.add_web_account)
+        online_heading.addWidget(add_web_account_button)
+        remove_web_account_button = ToolButton(FIF.REMOVE)
+        remove_web_account_button.setFixedSize(38, 36)
+        remove_web_account_button.setToolTip("移除所选网页登录账户")
+        remove_web_account_button.clicked.connect(self.remove_web_account)
+        online_heading.addWidget(remove_web_account_button)
+        token_layout.addLayout(online_heading)
+        token_layout.addWidget(QLabel(
+            "网页登录账户独立保存；密码和短信验证码仅输入 ModelScope 官方页面。",
+            objectName="subtitle",
+        ))
+        self.web_account_table = QTableWidget(0, 4)
+        self.web_account_table.setHorizontalHeaderLabels(["账户名称", "用户名", "状态", "操作"])
+        self.web_account_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.web_account_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.web_account_table.verticalHeader().setDefaultSectionSize(42)
+        self.web_account_table.horizontalHeader().setStretchLastSection(True)
+        self.web_account_table.setColumnWidth(0, 190)
+        self.web_account_table.setColumnWidth(1, 160)
+        self.web_account_table.setColumnWidth(2, 90)
+        self.web_account_table.setMaximumHeight(190)
+        self.web_account_table.itemChanged.connect(self._web_account_item_changed)
+        token_layout.addWidget(self.web_account_table)
 
         download_card = QFrame(objectName="card")
         download_setting_layout = QVBoxLayout(download_card)
         download_setting_layout.setContentsMargins(20, 18, 20, 20)
-        download_setting_layout.addWidget(QLabel("下载设置", objectName="section"))
+        download_setting_layout.setSpacing(14)
+        download_setting_layout.addWidget(QLabel("下载设置", objectName="panelTitle"))
         download_setting_layout.addWidget(QLabel("默认下载路径", objectName="subtitle"))
         download_path_row = QHBoxLayout()
         self.download_path_edit = QLineEdit()
@@ -1556,20 +1842,7 @@ class MainWindow(FluentWindow):
         player_card = QFrame(objectName="card")
         player_layout = QVBoxLayout(player_card)
         player_layout.setContentsMargins(20, 18, 20, 20)
-        player_heading = QHBoxLayout()
-        player_heading.addWidget(QLabel("播放设置", objectName="section"))
-        player_heading.addStretch()
-        add_player_button = ToolButton(FIF.ADD)
-        add_player_button.setFixedSize(38, 36)
-        add_player_button.setToolTip("添加播放器")
-        add_player_button.clicked.connect(self.add_external_player)
-        player_heading.addWidget(add_player_button)
-        remove_player_button = ToolButton(FIF.REMOVE)
-        remove_player_button.setFixedSize(38, 36)
-        remove_player_button.setToolTip("删除所选播放器")
-        remove_player_button.clicked.connect(self.remove_external_player)
-        player_heading.addWidget(remove_player_button)
-        player_layout.addLayout(player_heading)
+        player_layout.addWidget(QLabel("播放设置", objectName="panelTitle"))
         self.builtin_player_enabled = FluentSwitchButton("使用本地 PotPlayer 作为默认视频/图片播放器")
         self.builtin_player_enabled.setChecked(True)
         self.builtin_player_enabled.toggled.connect(self._builtin_player_setting_changed)
@@ -1589,7 +1862,21 @@ class MainWindow(FluentWindow):
         player_layout.addLayout(player_install_row)
         self.builtin_player_status = QLabel("PotPlayer：正在检查", objectName="subtitle")
         player_layout.addWidget(self.builtin_player_status)
-        player_layout.addWidget(QLabel("第三方播放器", objectName="section"))
+        player_heading = QHBoxLayout()
+        self.player_heading_label = QLabel("第三方播放器", objectName="section")
+        player_heading.addWidget(self.player_heading_label, 0, Qt.AlignmentFlag.AlignTop)
+        player_heading.addStretch()
+        self.add_player_button = ToolButton(FIF.ADD)
+        self.add_player_button.setFixedSize(38, 36)
+        self.add_player_button.setToolTip("添加播放器")
+        self.add_player_button.clicked.connect(self.add_external_player)
+        player_heading.addWidget(self.add_player_button, 0, Qt.AlignmentFlag.AlignTop)
+        self.remove_player_button = ToolButton(FIF.REMOVE)
+        self.remove_player_button.setFixedSize(38, 36)
+        self.remove_player_button.setToolTip("删除所选播放器")
+        self.remove_player_button.clicked.connect(self.remove_external_player)
+        player_heading.addWidget(self.remove_player_button, 0, Qt.AlignmentFlag.AlignTop)
+        player_layout.addLayout(player_heading)
         player_layout.addWidget(QLabel("媒体右键菜单会在本地 PotPlayer 之后显示以下第三方播放器。", objectName="subtitle"))
         self.player_table = QTableWidget(0, 2)
         self.player_table.setHorizontalHeaderLabels(["播放器名称", "程序路径"])
@@ -1603,6 +1890,7 @@ class MainWindow(FluentWindow):
         aria_card = QFrame(objectName="card")
         aria_layout = QVBoxLayout(aria_card)
         aria_layout.setContentsMargins(20, 18, 20, 20)
+        aria_layout.setSpacing(14)
         aria_layout.addWidget(QLabel("aria2-next 详细配置", objectName="section"))
         aria_layout.addWidget(QLabel("按文件大小自动分配 HTTP 连接和下载分段，并为小文件仓库增加并行任务。", objectName="subtitle"))
         self.aria_strategy_combo = CleanComboBox()
@@ -1610,7 +1898,7 @@ class MainWindow(FluentWindow):
         aria_layout.addWidget(self.aria_strategy_combo)
         aria_grid = QGridLayout()
         aria_grid.setHorizontalSpacing(12)
-        aria_grid.setVerticalSpacing(10)
+        aria_grid.setVerticalSpacing(14)
         aria_grid.addWidget(QLabel("文件类别"), 0, 0)
         aria_grid.addWidget(QLabel("大小阈值"), 0, 1)
         aria_grid.addWidget(QLabel("HTTP 连接 / 分段数"), 0, 2)
@@ -1759,7 +2047,7 @@ class MainWindow(FluentWindow):
         index_card = QFrame(objectName="card")
         index_layout = QVBoxLayout(index_card)
         index_layout.setContentsMargins(20, 18, 20, 20)
-        index_layout.addWidget(QLabel("索引和预览", objectName="section"))
+        index_layout.addWidget(QLabel("索引和预览", objectName="panelTitle"))
         index_layout.addWidget(QLabel("索引更新", objectName="section"))
         index_layout.addWidget(QLabel(
             "启动时完整更新一次；日常修改会等到空闲或程序进入后台后再更新。",
@@ -1911,7 +2199,7 @@ class MainWindow(FluentWindow):
         ))
 
         panel_specs = (
-            ("账号设置", FIF.PEOPLE, "ModelScope 账户", "Token 使用设备绑定加密保存", token_card),
+            ("账号设置", FIF.PEOPLE, "ModelScope 账户", "Token 与网页登录信息使用设备绑定加密保存", token_card),
             ("下载设置", FIF.DOWNLOAD, "下载与传输", "默认目录、aria2-next 分段和共享限速", download_card),
             ("播放设置", FIF.PLAY, "媒体播放器", "内置 PotPlayer 与第三方播放器", player_card),
             ("索引和预览", FIF.SEARCH, "索引与预览", "后台索引、缩略图和复制阈值", index_card),
@@ -1920,7 +2208,7 @@ class MainWindow(FluentWindow):
         settings_layout.addWidget(appearance_group)
         for group_title, icon, title, description, panel in panel_specs:
             for label in panel.findChildren(QLabel, options=Qt.FindChildOption.FindDirectChildrenOnly):
-                if label.objectName() == "section":
+                if label.objectName() == "panelTitle":
                     label.hide()
                     break
             group = SettingCardGroup(group_title, settings_content)
@@ -2304,8 +2592,10 @@ class MainWindow(FluentWindow):
             self.account_store.save(migrated)
             destroy_saved_token(self.settings)
         self.accounts = self.account_store.list_accounts()
+        self.web_accounts = self.account_store.list_web_accounts()
         self.session_tokens = {account.account_id: account.token for account in self.accounts if account.token}
         self._render_accounts()
+        self._render_web_accounts()
         self.backup_jobs = self.backup_store.list_jobs()
         self.image_records = self.image_store.list_records()
         self._render_backup_account_options()
@@ -2487,6 +2777,129 @@ class MainWindow(FluentWindow):
         self.token_edit.setText(self.session_tokens.get(account.account_id, account.token))
         self.remember_token.setChecked(account.remember)
 
+    @staticmethod
+    def _web_account_key(account_id: str) -> str:
+        return f"web:{account_id}"
+
+    def _token_service_for_repo(self, repo: Repository) -> ModelScopeService | None:
+        for account in self.accounts:
+            service = self.account_services.get(account.account_id)
+            if not service:
+                continue
+            if any(
+                candidate.repo_type == repo.repo_type and candidate.repo_id == repo.repo_id
+                for candidate in self.account_repositories.get(account.account_id, [])
+            ):
+                return service
+        return None
+
+    def _selected_web_account_id(self) -> str | None:
+        row = self.web_account_table.currentRow() if hasattr(self, "web_account_table") else -1
+        item = self.web_account_table.item(row, 0) if row >= 0 else None
+        return str(item.data(Qt.ItemDataRole.UserRole)) if item else None
+
+    def _render_web_accounts(self) -> None:
+        if not hasattr(self, "web_account_table"):
+            return
+        selected_id = self._selected_web_account_id()
+        table = self.web_account_table
+        table.blockSignals(True)
+        table.setRowCount(len(self.web_accounts))
+        for row, account in enumerate(self.web_accounts):
+            label_item = QTableWidgetItem(account.label)
+            label_item.setData(Qt.ItemDataRole.UserRole, account.account_id)
+            table.setItem(row, 0, label_item)
+            username_item = QTableWidgetItem(account.username or "--")
+            username_item.setFlags(username_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            table.setItem(row, 1, username_item)
+            status = "成功" if self.account_store.load_web_session(account.account_id) else "尚未登录"
+            status_item = QTableWidgetItem(status)
+            status_item.setFlags(status_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            table.setItem(row, 2, status_item)
+            login_button = QPushButton("在线登录", objectName="primary")
+            login_button.clicked.connect(
+                lambda checked=False, account_id=account.account_id: self.open_online_login(account_id)
+            )
+            table.setCellWidget(row, 3, login_button)
+            if account.account_id == selected_id:
+                table.selectRow(row)
+        table.blockSignals(False)
+
+    def _web_account_item_changed(self, item: QTableWidgetItem) -> None:
+        if item.column() != 0:
+            return
+        account_id = str(item.data(Qt.ItemDataRole.UserRole) or "")
+        account = next((value for value in self.web_accounts if value.account_id == account_id), None)
+        if not account:
+            return
+        account.label = item.text().strip() or account.username or "ModelScope 账户"
+        self.account_store.save_web_account(account)
+        self._render_repositories()
+
+    def add_web_account(self) -> None:
+        index = len(self.web_accounts) + 1
+        account = self.account_store.save_web_account(
+            WebAccountRecord("", f"网页登录账户 {index}", "", "login_required")
+        )
+        self.web_accounts.append(account)
+        self._render_web_accounts()
+        self.web_account_table.selectRow(len(self.web_accounts) - 1)
+        self.web_account_table.editItem(self.web_account_table.item(len(self.web_accounts) - 1, 0))
+
+    def remove_web_account(self) -> None:
+        account_id = self._selected_web_account_id()
+        account = next((value for value in self.web_accounts if value.account_id == account_id), None)
+        if not account:
+            return
+        answer = QMessageBox.question(
+            self, "移除网页登录账户",
+            f"确定移除网页登录账户 {account.label}？本地保存的 Cookie 将被销毁。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        key = self._web_account_key(account.account_id)
+        self.account_store.remove_web_account(account.account_id)
+        self.web_accounts = [value for value in self.web_accounts if value.account_id != account.account_id]
+        self.account_services.pop(key, None)
+        self.account_repositories.pop(key, None)
+        self._render_web_accounts()
+        self._render_repositories()
+
+    def open_online_login(self, account_id: str | None = None) -> None:
+        account_id = account_id or self._selected_web_account_id()
+        account = next((item for item in self.web_accounts if item.account_id == account_id), None)
+        if not account:
+            QMessageBox.information(self, self._t("请选择账户"), self._t("请先添加一个网页登录账户。"))
+            return
+        dialog = ModelScopeLoginDialog(account.label or account.username, self)
+        dialog.session_captured.connect(
+            lambda session, info, current_id=account.account_id: self._online_login_completed(current_id, session, info)
+        )
+        dialog.finished.connect(dialog.deleteLater)
+        self.online_login_dialog = dialog
+        dialog.show()
+
+    def _online_login_completed(
+        self,
+        account_id: str,
+        session: ModelScopeWebSession,
+        user_info: dict,
+    ) -> None:
+        account = next((item for item in self.web_accounts if item.account_id == account_id), None)
+        if not account:
+            return
+        web_username = web_session_username(user_info)
+        account.username = web_username
+        account.status = "connected"
+        self.account_store.save_web_account(account)
+        self.account_store.save_web_session(account_id, session)
+        self._render_web_accounts()
+        self._log(f"网页登录信息已安全保存：{account.label}")
+        QMessageBox.information(self, self._t("在线登录成功"), self._t("网页登录信息已使用设备绑定加密保存。"))
+        QTimer.singleShot(0, self.load_repositories)
+
     def add_account(self) -> None:
         self.account_table.clearSelection()
         self.account_table.setCurrentItem(None)
@@ -2551,10 +2964,11 @@ class MainWindow(FluentWindow):
         selected = self.backup_account_combo.currentData()
         self.backup_account_combo.blockSignals(True)
         self.backup_account_combo.clear()
-        for account in self.accounts:
-            self.backup_account_combo.addItem(account.label or account.username, account.account_id)
+        account_options = [(account.account_id, account.label or account.username) for account in self.accounts]
+        for account_id, label in account_options:
+            self.backup_account_combo.addItem(label, account_id)
         index = self.backup_account_combo.findData(selected)
-        self.backup_account_combo.setCurrentIndex(index if index >= 0 else (0 if self.accounts else -1))
+        self.backup_account_combo.setCurrentIndex(index if index >= 0 else (0 if account_options else -1))
         self.backup_account_combo.blockSignals(False)
         self._render_backup_repository_options()
 
@@ -2782,10 +3196,11 @@ class MainWindow(FluentWindow):
         selected = self.image_account_combo.currentData() or self.settings.value("image/account_id", "")
         self.image_account_combo.blockSignals(True)
         self.image_account_combo.clear()
-        for account in self.accounts:
-            self.image_account_combo.addItem(account.label or account.username, account.account_id)
+        account_options = [(account.account_id, account.label or account.username) for account in self.accounts]
+        for account_id, label in account_options:
+            self.image_account_combo.addItem(label, account_id)
         index = self.image_account_combo.findData(selected)
-        self.image_account_combo.setCurrentIndex(index if index >= 0 else (0 if self.accounts else -1))
+        self.image_account_combo.setCurrentIndex(index if index >= 0 else (0 if account_options else -1))
         self.image_account_combo.blockSignals(False)
         self._render_image_repository_options()
 
@@ -3395,6 +3810,8 @@ class MainWindow(FluentWindow):
         app.setPalette(palette)
         app.setStyleSheet("")
         app.setStyleSheet(theme_qss(dark, acrylic))
+        if hasattr(self, "queue_table"):
+            self._render_upload_queue()
         self.setProperty("theme", "dark" if dark else "light")
         self._apply_window_effects(dark, acrylic)
         self._sync_matplotlib_theme(dark)
@@ -4336,6 +4753,7 @@ class MainWindow(FluentWindow):
         self.session_tokens[account.account_id] = token
         self.account_services[account.account_id] = service
         self.active_account_id = account.account_id
+        self.active_account_kind = "token"
         self.service = service
         self._render_accounts()
         for row in range(self.account_table.rowCount()):
@@ -4359,10 +4777,14 @@ class MainWindow(FluentWindow):
             for account in self.accounts
             if account.enabled and self.session_tokens.get(account.account_id, account.token)
         }
-        if not account_tokens:
+        web_sessions = {
+            self._web_account_key(account.account_id): self.account_store.load_web_session(account.account_id)
+            for account in self.web_accounts
+            if self.account_store.load_web_session(account.account_id)
+        }
+        if not account_tokens and not web_sessions:
             self._prompt_for_settings()
             return
-        accounts = {account.account_id: account for account in self.accounts}
 
         def action():
             successes = []
@@ -4375,6 +4797,14 @@ class MainWindow(FluentWindow):
                     successes.append((account_id, service, username, repos))
                 except Exception as exc:
                     failures.append((account_id, str(exc)))
+            for account_key, session in web_sessions.items():
+                try:
+                    service = ModelScopeWebService(session)
+                    username = service.verify()
+                    repos = service.list_repositories()
+                    successes.append((account_key, service, username, repos))
+                except Exception as exc:
+                    failures.append((account_key, str(exc)))
             return successes, failures
 
         self._run_task(action, self._repositories_loaded, "正在读取所有账户仓库…")
@@ -4394,17 +4824,35 @@ class MainWindow(FluentWindow):
                 account.status = "connected"
                 account.token = self.session_tokens.get(account_id, account.token)
                 self.account_store.save(account)
+            elif account_id.startswith("web:"):
+                raw_id = account_id.removeprefix("web:")
+                web_account = next((item for item in self.web_accounts if item.account_id == raw_id), None)
+                if web_account:
+                    web_account.username = username
+                    web_account.status = "connected"
+                    self.account_store.save_web_account(web_account)
             self.account_store.cache_repositories(account_id, repos)
         for account_id, error in failures:
             account = next((item for item in self.accounts if item.account_id == account_id), None)
             if account:
                 account.status = "failed"
-            self._log(f"账户 {account.label if account else account_id} 验证失败：{error}")
+            web_account = None
+            if account_id.startswith("web:"):
+                raw_id = account_id.removeprefix("web:")
+                web_account = next((item for item in self.web_accounts if item.account_id == raw_id), None)
+                if web_account:
+                    web_account.status = "failed"
+            self._log(f"账户 {(account or web_account).label if (account or web_account) else account_id} 验证失败：{error}")
         self.repositories = [repo for repos in self.account_repositories.values() for repo in repos]
         if self.active_account_id not in self.account_services and successes:
             self.active_account_id = successes[0][0]
+        self.active_account_kind = (
+            "web" if str(self.active_account_id or "").startswith("web:")
+            else "token" if self.active_account_id else None
+        )
         self.service = self.account_services.get(self.active_account_id) if self.active_account_id else None
         self._render_accounts()
+        self._render_web_accounts()
         self._render_repositories()
         self._render_backup_account_options()
         self._render_backup_jobs()
@@ -4445,6 +4893,14 @@ class MainWindow(FluentWindow):
                 child.setData(0, Qt.ItemDataRole.UserRole, ("public", repo))
                 child.setToolTip(0, f"{repo.repo_type} · public · 只读")
                 group.addChild(child)
+
+        separator = QTreeWidgetItem(["────────────────────────"])
+        separator.setFlags(separator.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+        self.repo_list.addTopLevelItem(separator)
+        token_heading = QTreeWidgetItem(["Token 登录账户（删除/移动/重命名不可用）"])
+        token_heading.setFlags(token_heading.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+        token_heading.setToolTip(0, "请使用在线登录列表执行")
+        self.repo_list.addTopLevelItem(token_heading)
         for account in self.accounts:
             repos = self.account_repositories.get(account.account_id, [])
             account_node = QTreeWidgetItem([account.label or account.username])
@@ -4463,6 +4919,33 @@ class MainWindow(FluentWindow):
                     child = QTreeWidgetItem([repo.repo_id])
                     child.setData(0, Qt.ItemDataRole.UserRole, (account.account_id, repo))
                     child.setToolTip(0, f"{repo.repo_type} · {repo.visibility}")
+                    group.addChild(child)
+
+        separator = QTreeWidgetItem(["────────────────────────"])
+        separator.setFlags(separator.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+        self.repo_list.addTopLevelItem(separator)
+        web_heading = QTreeWidgetItem(["网页登录账户（删除/移动/重命名支持）"])
+        web_heading.setFlags(web_heading.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+        self.repo_list.addTopLevelItem(web_heading)
+        for account in self.web_accounts:
+            account_key = self._web_account_key(account.account_id)
+            repos = self.account_repositories.get(account_key, [])
+            account_node = QTreeWidgetItem([account.label or account.username])
+            account_node.setData(0, Qt.ItemDataRole.UserRole, ("web-account", account.account_id))
+            account_node.setExpanded(True)
+            self.repo_list.addTopLevelItem(account_node)
+            for repo_type in ("model", "dataset"):
+                if selected_type != "all" and repo_type != selected_type:
+                    continue
+                matching = [repo for repo in repos if repo.repo_type == repo_type]
+                group = QTreeWidgetItem([labels[repo_type]])
+                group.setFlags(group.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+                group.setExpanded(True)
+                account_node.addChild(group)
+                for repo in matching:
+                    child = QTreeWidgetItem([repo.repo_id])
+                    child.setData(0, Qt.ItemDataRole.UserRole, (account_key, repo))
+                    child.setToolTip(0, f"{repo.repo_type} · {repo.visibility} · 网页登录可写")
                     group.addChild(child)
 
     def _repo_selected(self) -> None:
@@ -4488,6 +4971,7 @@ class MainWindow(FluentWindow):
         if service is None:
             return
         self.active_account_id = None if public else account_id
+        self.active_account_kind = "public" if public else ("web" if str(account_id).startswith("web:") else "token")
         self.service = service
         self.selected_repo = repo
         self.selected_repo_public = public
@@ -4539,8 +5023,21 @@ class MainWindow(FluentWindow):
             return
         account_id, repo = data
         menu = QMenu(self)
+        menu.setToolTipsVisible(True)
         open_action = menu.addAction("打开网页端")
         remove_action = menu.addAction("移除") if account_id == "public" else None
+        menu.addSeparator()
+        delete_action = menu.addAction("删除")
+        move_action = menu.addAction("移动")
+        rename_action = menu.addAction("重命名（区分大小写）")
+        tooltip = (
+            "这是只读" if account_id == "public"
+            else "请在仓库内选择文件或文件夹" if str(account_id).startswith("web:")
+            else "请使用在线登录列表执行"
+        )
+        for action in (delete_action, move_action, rename_action):
+            action.setEnabled(False)
+            action.setToolTip(tooltip)
         chosen = menu.exec(self.repo_list.viewport().mapToGlobal(position))
         if chosen is open_action:
             QDesktopServices.openUrl(QUrl(self._repository_web_url(repo)))
@@ -4563,16 +5060,17 @@ class MainWindow(FluentWindow):
                 return
         self._run_task(lambda: self.service.list_entries(repo), self._files_loaded, "正在读取仓库目录…")
 
-    def _files_loaded(self, entries: list[RemoteEntry]) -> None:
+    def _files_loaded(self, entries: list[RemoteEntry], persist: bool = True) -> None:
         self.remote_entries = entries
         self.remote_direct_cache.clear()
         self._reset_thumbnail_queue(entries)
-        if self.selected_repo:
+        if self.selected_repo and persist:
             self.account_store.cache_entries(
                 PUBLIC_ACCOUNT_ID if self.selected_repo_public else str(self.active_account_id or ""),
                 self.selected_repo,
                 entries,
             )
+        if self.selected_repo:
             self._refresh_tag_filter()
         paths = self._populate_remote_tree(
             self.remote_tree, entries, self.selected_repo, self.selected_repo_public,
@@ -4812,7 +5310,9 @@ class MainWindow(FluentWindow):
         entry = item.data(Qt.ItemDataRole.UserRole) if item else None
         enabled = isinstance(entry, RemoteEntry)
         self.download_selected_button.setEnabled(enabled)
-        self.web_manage_button.setEnabled(enabled and self.selected_repo is not None)
+        self.web_manage_button.setEnabled(
+            enabled and self.selected_repo is not None and self.active_account_kind == "web"
+        )
 
     def _open_remote_thumbnail(self, item: QListWidgetItem) -> None:
         entry = item.data(Qt.ItemDataRole.UserRole)
@@ -4838,7 +5338,9 @@ class MainWindow(FluentWindow):
         entry = items[0].data(0, Qt.ItemDataRole.UserRole) if items else None
         enabled = isinstance(entry, RemoteEntry)
         self.download_selected_button.setEnabled(enabled)
-        self.web_manage_button.setEnabled(enabled and self.selected_repo is not None)
+        self.web_manage_button.setEnabled(
+            enabled and self.selected_repo is not None and self.active_account_kind == "web"
+        )
 
     def _open_remote_detail(self, item: QTreeWidgetItem, _column: int = 0) -> None:
         entry = item.data(0, Qt.ItemDataRole.UserRole)
@@ -4874,14 +5376,16 @@ class MainWindow(FluentWindow):
         if isinstance(entry, RemoteEntry):
             self.add_remote_download(entry)
 
-    def _open_selected_remote_web(self) -> None:
+    def _delete_selected_remote(self) -> None:
         items = self.remote_detail_tree.selectedItems()
         entry = items[0].data(0, Qt.ItemDataRole.UserRole) if items else None
         if not isinstance(entry, RemoteEntry):
             item = self.remote_thumbnail_list.currentItem()
             entry = item.data(Qt.ItemDataRole.UserRole) if item else None
         if isinstance(entry, RemoteEntry) and self.selected_repo:
-            QDesktopServices.openUrl(QUrl(self._repository_web_url(self.selected_repo, entry.path if entry.is_dir else "")))
+            self._delete_remote_entry(
+                str(self.active_account_id or ""), self.selected_repo, entry, self.remote_entries,
+            )
 
     def _schedule_global_search(self) -> None:
         self.resource_search_timer.start()
@@ -4944,6 +5448,7 @@ class MainWindow(FluentWindow):
             query, file_type, account_id, repo_type, repo_id, path_prefix, tag_name
         )
         account_labels = {account.account_id: account.label for account in self.accounts}
+        account_labels.update({self._web_account_key(account.account_id): account.label for account in self.web_accounts})
         account_labels[PUBLIC_ACCOUNT_ID] = "Public"
         type_labels = {
             "video": self._t("视频"), "image": self._t("图片"),
@@ -5004,7 +5509,11 @@ class MainWindow(FluentWindow):
         if repo is None:
             repo = Repository(record.repo_id, record.repo_type)
         entry = RemoteEntry(record.path, record.size, record.sha256, record.is_dir)
-        self._show_remote_menu(self.global_search_tree, position, entry, service, repo, [entry], record.account_id)
+        indexed_entries = self.account_store.repository_entries(record.account_id, repo.repo_type, repo.repo_id)
+        entries = [
+            RemoteEntry(value.path, value.size, value.sha256, value.is_dir) for value in indexed_entries
+        ] or [entry]
+        self._show_remote_menu(self.global_search_tree, position, entry, service, repo, entries, record.account_id)
 
     def _open_global_search_result(self, item: QTreeWidgetItem, column: int = 0) -> None:
         record = item.data(0, Qt.ItemDataRole.UserRole)
@@ -5021,6 +5530,7 @@ class MainWindow(FluentWindow):
         if repo is None:
             repo = Repository(record.repo_id, record.repo_type)
         self.active_account_id = None if public else record.account_id
+        self.active_account_kind = "public" if public else ("web" if record.account_id.startswith("web:") else "token")
         self.service = service
         self.selected_repo = repo
         self.selected_repo_public = public
@@ -5111,9 +5621,11 @@ class MainWindow(FluentWindow):
         tag_account_id: str,
     ) -> None:
         menu = QMenu(self)
+        menu.setToolTipsVisible(True)
         link_action = menu.addAction(self._t("复制链接" if entry.is_dir else "复制直链"))
         copy_action = menu.addAction("复制")
         paste_action = menu.addAction("粘贴") if self.copy_source and not self.selected_repo_public else None
+        paste_move_action = menu.addAction("粘贴移动") if self.move_source and not self.selected_repo_public else None
         download_action = menu.addAction(self._t("添加到下载队列"))
         builtin_action = None
         player_actions: dict[QAction, dict[str, str]] = {}
@@ -5135,7 +5647,15 @@ class MainWindow(FluentWindow):
             tag_actions[action] = tag
         new_tag_action = tag_menu.addAction("新建标签")
         menu.addSeparator()
-        web_action = menu.addAction(self._t("在网页端管理 / 删除"))
+        delete_action = menu.addAction(self._t("删除"))
+        move_action = menu.addAction(self._t("移动"))
+        rename_action = menu.addAction(self._t("重命名（区分大小写）"))
+        web_writable = tag_account_id.startswith("web:")
+        if not web_writable:
+            tooltip = "这是只读" if tag_account_id == PUBLIC_ACCOUNT_ID else "请使用在线登录列表执行"
+            for action in (delete_action, move_action, rename_action):
+                action.setEnabled(False)
+                action.setToolTip(tooltip)
         chosen = menu.exec(tree.viewport().mapToGlobal(position))
         if chosen is link_action:
             self._copy_remote_link(entry, service, repo)
@@ -5145,6 +5665,9 @@ class MainWindow(FluentWindow):
         elif paste_action is not None and chosen is paste_action:
             destination = entry.path if entry.is_dir else entry.path.rsplit("/", 1)[0] if "/" in entry.path else ""
             self._paste_remote_copy(service, repo, destination)
+        elif paste_move_action is not None and chosen is paste_move_action:
+            destination = entry.path if entry.is_dir else entry.path.rsplit("/", 1)[0] if "/" in entry.path else ""
+            self._paste_remote_move(tag_account_id, service, repo, destination)
         elif chosen is download_action:
             self.add_remote_download(entry, service, repo, entries)
         elif builtin_action is not None and chosen is builtin_action:
@@ -5159,23 +5682,308 @@ class MainWindow(FluentWindow):
             name, accepted = QInputDialog.getText(self, "新建标签", "标签名称：")
             if accepted and name.strip():
                 self._save_entry_tags(tag_account_id, repo, entry.path, list(assigned_tags) + [name])
-        elif chosen is web_action:
-            QDesktopServices.openUrl(QUrl(self._repository_web_url(repo, entry.path if entry.is_dir else "")))
+        elif chosen is delete_action:
+            self._delete_remote_entry(tag_account_id, repo, entry, entries)
+        elif chosen is move_action:
+            self.move_source = (tag_account_id, service, repo, list(entries), entry)
+            self._log(f"已选择移动：{entry.path}；请选择目标目录后右键粘贴移动")
+        elif chosen is rename_action:
+            self._rename_remote_entry(tag_account_id, service, repo, entry, entries)
 
     def _show_paste_menu(
         self, view: QWidget, position, service: ModelScopeService, repo: Repository, destination: str,
     ) -> None:
         menu = QMenu(self)
+        menu.setToolTipsVisible(True)
         paste_action = menu.addAction("粘贴")
         paste_action.setEnabled(bool(self.copy_source) and not self.selected_repo_public)
+        paste_move_action = menu.addAction("粘贴移动")
+        paste_move_action.setEnabled(bool(self.move_source) and not self.selected_repo_public)
         chosen = menu.exec(view.viewport().mapToGlobal(position))
         if chosen is paste_action and paste_action.isEnabled():
             self._paste_remote_copy(service, repo, destination)
+        elif chosen is paste_move_action and paste_move_action.isEnabled():
+            account_key = str(self.active_account_id or "")
+            self._paste_remote_move(account_key, service, repo, destination)
+
+    @staticmethod
+    def _entry_file_paths(entry: RemoteEntry, entries: list[RemoteEntry]) -> list[str]:
+        if not entry.is_dir:
+            return [entry.path]
+        prefix = entry.path.strip("/")
+        return sorted(
+            [value.path for value in entries if not value.is_dir and value.path.startswith(prefix + "/")],
+            reverse=True,
+        )
+
+    def _web_session_for_key(self, account_key: str) -> ModelScopeWebSession | None:
+        if not account_key.startswith("web:"):
+            return None
+        return self.account_store.load_web_session(account_key.removeprefix("web:"))
+
+    def _delete_remote_entry(
+        self, account_key: str, repo: Repository, entry: RemoteEntry, entries: list[RemoteEntry],
+    ) -> None:
+        session = self._web_session_for_key(account_key)
+        if session is None:
+            QMessageBox.information(self, "需要在线登录", "转到设置页面添加账号。")
+            return
+        paths = self._entry_file_paths(entry, entries)
+        if not paths:
+            QMessageBox.information(self, "删除", "文件夹中没有可删除的文件。")
+            return
+        answer = QMessageBox.warning(
+            self,
+            "确认删除",
+            f"此操作不可逆，确定删除“{entry.path}”？" + (f"\n将递归删除 {len(paths)} 个文件。" if entry.is_dir else ""),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.delete_task = DeleteThread(session, repo, paths, self)
+        self.delete_task.completed.connect(
+            lambda result, key=account_key, value=repo, path=entry.path: self._remote_delete_completed(
+                key, value, result, path,
+            )
+        )
+        self.delete_task.failed.connect(lambda error: QMessageBox.warning(self, "删除失败", error))
+        self.delete_task.finished.connect(self.delete_task.deleteLater)
+        self.delete_task.start()
+        self._log(f"开始删除：{repo.repo_id}/{entry.path} · {len(paths)} 个文件")
+
+    def _cached_remote_entries(self, account_key: str, repo: Repository) -> list[RemoteEntry]:
+        if self.selected_repo == repo and (
+            (self.selected_repo_public and account_key == PUBLIC_ACCOUNT_ID)
+            or (not self.selected_repo_public and account_key == self.active_account_id)
+        ):
+            return list(self.remote_entries)
+        return [
+            RemoteEntry(value.path, value.size, value.sha256, value.is_dir)
+            for value in self.account_store.repository_entries(account_key, repo.repo_type, repo.repo_id)
+        ]
+
+    def _apply_local_remote_changes(
+        self,
+        account_key: str,
+        repo: Repository,
+        removed: Iterable[str] = (),
+        removed_prefixes: Iterable[str] = (),
+        additions: Iterable[RemoteEntry] = (),
+    ) -> None:
+        removed_set = set(removed)
+        prefixes = list(dict.fromkeys(path.strip("/") for path in removed_prefixes if path.strip("/")))
+        before = self._cached_remote_entries(account_key, repo)
+        values = {
+            entry.path: entry
+            for entry in before
+            if entry.path not in removed_set
+            and not any(entry.path == prefix or entry.path.startswith(prefix + "/") for prefix in prefixes)
+        }
+        additions = list(additions)
+        for entry in additions:
+            values[entry.path] = entry
+        updated = sorted(values.values(), key=lambda value: value.path)
+        if additions:
+            self.account_store.cache_entries(account_key, repo, updated)
+            self.folder_index.update_repository(repo, updated, False)
+        else:
+            removed_entries = [entry for entry in before if entry.path not in values]
+            self.account_store.remove_entry_prefixes(
+                account_key, repo.repo_type, repo.repo_id, [*removed_set, *prefixes],
+            )
+            self.folder_index.remove_entries(repo, removed_entries, prefixes, False)
+        current = self.selected_repo == repo and not self.selected_repo_public and account_key == self.active_account_id
+        if current:
+            self._files_loaded(updated, persist=False)
+
+    def _remote_delete_completed(
+        self, account_key: str, repo: Repository, result: dict, selected_path: str = "",
+    ) -> None:
+        self.delete_task = None
+        deleted = list(result.get("deleted", []))
+        failures = dict(result.get("failures", {}))
+        remove_prefixes = [selected_path] if selected_path and not failures else []
+        self._apply_local_remote_changes(
+            account_key, repo, removed=deleted, removed_prefixes=remove_prefixes,
+        )
+        self._log(f"删除完成：{len(deleted)} 个成功，{len(failures)} 个失败")
+        if failures:
+            QMessageBox.warning(self, "删除完成", f"已删除 {len(deleted)} 个文件，{len(failures)} 个失败。")
+        else:
+            QMessageBox.information(self, "删除完成", f"已删除 {len(deleted)} 个文件，当前目录已刷新。")
+
+    def _confirm_relocate_threshold(self, entry: RemoteEntry, entries: list[RemoteEntry], verb: str) -> bool:
+        if entry.is_dir:
+            total_size = sum(
+                value.size for value in entries
+                if not value.is_dir and value.path.startswith(entry.path.strip("/") + "/")
+            )
+        else:
+            total_size = entry.size
+        if total_size <= self._copy_threshold_bytes():
+            return True
+        answer = QMessageBox.question(
+            self,
+            f"{verb}较大资源",
+            f"当前文件/文件夹大小为 {format_size(total_size)}，超过下载阈值。是否先下载到临时目录再执行{verb}？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    @staticmethod
+    def _relocate_mappings(entry: RemoteEntry, entries: list[RemoteEntry], target_path: str) -> dict[str, str]:
+        if not entry.is_dir:
+            return {entry.path: target_path}
+        prefix = entry.path.strip("/")
+        return {
+            value.path: normalize_remote_path(target_path, value.path[len(prefix):].strip("/"))
+            for value in entries
+            if not value.is_dir and value.path.startswith(prefix + "/")
+        }
+
+    def _paste_remote_move(
+        self, destination_key: str, destination_service: ModelScopeService,
+        destination_repo: Repository, destination_folder: str,
+    ) -> None:
+        if not self.move_source:
+            return
+        source_key, source_service, source_repo, source_entries, selected = self.move_source
+        if self._web_session_for_key(source_key) is None:
+            QMessageBox.information(self, "需要在线登录", "转到设置页面添加账号。")
+            return
+        upload_service = self._token_service_for_repo(destination_repo)
+        if upload_service is None:
+            QMessageBox.information(
+                self, "需要 Token 账户", "请先添加可访问目标仓库的 Token 账户；上传不会使用网页登录接口。",
+            )
+            return
+        target = normalize_remote_path(destination_folder, Path(selected.path).name)
+        if source_repo == destination_repo and source_key == destination_key:
+            source_path = selected.path.strip("/")
+            if target == source_path:
+                QMessageBox.information(self, "移动", "目标路径与原路径相同。")
+                return
+            if selected.is_dir and (destination_folder == source_path or destination_folder.startswith(source_path + "/")):
+                QMessageBox.warning(self, "移动", "不能把文件夹移动到其自身或子目录中。")
+                return
+        if not self._confirm_relocate_threshold(selected, source_entries, "移动"):
+            return
+        mappings = self._relocate_mappings(selected, source_entries, target)
+        self._start_relocate(
+            source_key, source_service, source_repo, destination_key,
+            upload_service, destination_repo, source_entries, mappings,
+        )
+
+    def _rename_remote_entry(
+        self, account_key: str, service: ModelScopeService, repo: Repository,
+        entry: RemoteEntry, entries: list[RemoteEntry],
+    ) -> None:
+        current_name = Path(entry.path).name
+        new_name, accepted = QInputDialog.getText(
+            self, "重命名（区分大小写）", "新名称（区分大小写）：", text=current_name,
+        )
+        new_name = new_name.strip()
+        if not accepted:
+            return
+        if not new_name or new_name in {".", ".."} or "/" in new_name or "\\" in new_name:
+            QMessageBox.warning(self, "重命名", "请输入不包含路径分隔符的有效名称。")
+            return
+        if new_name == current_name:
+            QMessageBox.information(self, "重命名", "新名称与原名称相同。")
+            return
+        if not self._confirm_relocate_threshold(entry, entries, "重命名"):
+            return
+        upload_service = self._token_service_for_repo(repo)
+        if upload_service is None:
+            QMessageBox.information(
+                self, "需要 Token 账户", "请先添加可访问该仓库的 Token 账户；上传不会使用网页登录接口。",
+            )
+            return
+        parent = entry.path.rpartition("/")[0]
+        target = normalize_remote_path(parent, new_name)
+        mappings = self._relocate_mappings(entry, entries, target)
+        self._start_relocate(
+            account_key, service, repo, account_key, upload_service, repo, entries, mappings,
+        )
+
+    def _start_relocate(
+        self,
+        source_key: str,
+        source_service: ModelScopeService,
+        source_repo: Repository,
+        destination_key: str,
+        destination_service: ModelScopeService,
+        destination_repo: Repository,
+        source_entries: list[RemoteEntry],
+        mappings: dict[str, str],
+    ) -> None:
+        if not mappings:
+            QMessageBox.information(self, "操作", "没有可传输的文件。")
+            return
+        session = self._web_session_for_key(source_key)
+        if session is None:
+            QMessageBox.information(self, "需要在线登录", "转到设置页面添加账号。")
+            return
+        self.relocate_context = (source_key, source_repo, destination_key, destination_repo, source_entries)
+        self.relocate_task = RelocateThread(
+            source_service,
+            source_repo,
+            destination_service,
+            destination_repo,
+            mappings,
+            lambda path: delete_repository_file(session, source_repo.repo_id, source_repo.repo_type, path),
+            self,
+        )
+        self.relocate_task.completed.connect(self._relocate_completed)
+        self.relocate_task.failed.connect(lambda error: QMessageBox.warning(self, "操作失败", error))
+        self.relocate_task.finished.connect(self.relocate_task.deleteLater)
+        self.relocate_task.start()
+        self._log(f"开始下载、上传并移动：{len(mappings)} 个文件")
+
+    def _relocate_completed(self, result: dict) -> None:
+        context = self.relocate_context
+        self.relocate_task = None
+        self.relocate_context = None
+        if context is None:
+            return
+        source_key, source_repo, destination_key, destination_repo, source_entries = context
+        mappings = dict(result.get("mappings", {}))
+        upload_failed = set(result.get("upload_failed", []))
+        uploaded = set(mappings) - upload_failed
+        deleted = list(result.get("deleted", []))
+        source_by_path = {entry.path: entry for entry in source_entries}
+        additions = [
+            RemoteEntry(mappings[path], source_by_path[path].size, source_by_path[path].sha256, False)
+            for path in uploaded if path in source_by_path
+        ]
+        self._apply_local_remote_changes(destination_key, destination_repo, additions=additions)
+        if deleted:
+            self._apply_local_remote_changes(source_key, source_repo, removed=deleted)
+        delete_failed = dict(result.get("delete_failed", {}))
+        if upload_failed:
+            message = f"{len(uploaded)} 个上传成功，{len(upload_failed)} 个上传失败；源文件未删除。"
+            QMessageBox.warning(self, "操作未完成", message)
+        elif delete_failed:
+            message = f"全部上传成功；{len(deleted)} 个源文件已删除，{len(delete_failed)} 个删除失败。"
+            QMessageBox.warning(self, "操作部分完成", message)
+        else:
+            message = f"{len(uploaded)} 个文件上传完成并已删除原路径。"
+            QMessageBox.information(self, "操作完成", message)
+            self.move_source = None
+        self._log(message)
 
     def _paste_remote_copy(self, destination_service: ModelScopeService, destination_repo: Repository, destination_folder: str) -> None:
         if not self.copy_source or self.selected_repo_public:
             return
         source_service, source_repo, source_entries, selected = self.copy_source
+        upload_service = self._token_service_for_repo(destination_repo)
+        if upload_service is None:
+            QMessageBox.information(
+                self, "需要 Token 账户", "请先添加可访问目标仓库的 Token 账户；上传不会使用网页登录接口。",
+            )
+            return
         if selected.is_dir:
             total_size = self.folder_index.update_folder(
                 source_repo, selected.path, source_entries, repository_is_public(source_repo, source_service.token),
@@ -5192,7 +6000,7 @@ class MainWindow(FluentWindow):
                 return
         self.copy_task = CopyThread(
             source_service, source_repo, source_entries, selected,
-            destination_service, destination_repo, destination_folder, self,
+            upload_service, destination_repo, destination_folder, self,
         )
         self.copy_task.completed.connect(self._remote_copy_completed)
         self.copy_task.failed.connect(lambda error: QMessageBox.warning(self, "复制失败", error))
@@ -5605,6 +6413,8 @@ class MainWindow(FluentWindow):
                 status.setForeground(QColor("#0f7b0f"))
             elif item.status in {"failed", "cancelled", "skipped"}:
                 status.setForeground(QColor("#c42b1c"))
+            else:
+                status.setForeground(self.queue_table.palette().color(QPalette.ColorRole.Text))
             self.queue_table.setItem(row, 0, local)
             self.queue_table.setItem(row, 1, kind)
             self.queue_table.setItem(row, 2, target)
@@ -5628,7 +6438,7 @@ class MainWindow(FluentWindow):
         elif status in {"failed", "cancelled", "skipped"}:
             status_item.setForeground(QColor("#c42b1c"))
         else:
-            status_item.setForeground(QColor())
+            status_item.setForeground(self.queue_table.palette().color(QPalette.ColorRole.Text))
 
     def clear_download_queue(self) -> None:
         if self.task and self.task.isRunning():
@@ -5673,6 +6483,12 @@ class MainWindow(FluentWindow):
         if self.upload_session_service is None:
             if not self.service or not self.selected_repo:
                 return
+            upload_service = self._token_service_for_repo(self.selected_repo)
+            if upload_service is None:
+                QMessageBox.information(
+                    self, "需要 Token 账户", "请先添加可访问该仓库的 Token 账户；上传不会使用网页登录接口。",
+                )
+                return
             for row, item in enumerate(self.upload_items):
                 if item.status != "waiting":
                     continue
@@ -5681,7 +6497,7 @@ class MainWindow(FluentWindow):
                 except ValueError as exc:
                     QMessageBox.warning(self, self._t("路径无效"), str(exc))
                     return
-            self.upload_session_service = self.service
+            self.upload_session_service = upload_service
             self.upload_session_repo = self.selected_repo
             self.upload_session_account_id = self.active_account_id
             self.upload_ok = self.upload_failed = self.upload_cancelled = 0

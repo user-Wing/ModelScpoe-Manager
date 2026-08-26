@@ -4,11 +4,14 @@ from dataclasses import dataclass
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Callable, Iterable
+import threading
 from urllib.parse import unquote, urlparse, urlsplit
 
 import requests
 from requests.auth import AuthBase
 
+from .http_security import modelscope_token_headers
+from .local_paths import iter_contained_files, validate_upload_source
 from .transfer_policy import SharedRateLimiter
 
 if TYPE_CHECKING:
@@ -21,6 +24,7 @@ MAX_MODEL_UPLOAD_FILE_SIZE = 50 * 1024**3
 
 
 _UPLOAD_LIMITER = SharedRateLimiter()
+_SDK_UPLOAD_LOCK = threading.RLock()
 
 
 def configure_upload_limit_supplier(supplier: Callable[[], int]) -> None:
@@ -154,10 +158,7 @@ def oversized_upload_files(
 ) -> list[Path]:
     oversized: list[Path] = []
     for path in paths:
-        candidates = path.rglob("*") if path.is_dir() else (path,)
-        for candidate in candidates:
-            if not candidate.is_file():
-                continue
+        for candidate in iter_contained_files(path):
             try:
                 if candidate.stat().st_size > limit:
                     oversized.append(candidate.resolve())
@@ -262,7 +263,7 @@ class ModelScopeService:
 
     def download_to_file(self, repo: Repository, remote_path: str, target: Path) -> None:
         url = self.get_download_url(repo, remote_path)
-        headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
+        headers = modelscope_token_headers(url, self.token)
         with requests.get(url, headers=headers, stream=True, timeout=30) as response:
             response.raise_for_status()
             with target.open("wb") as output:
@@ -275,31 +276,34 @@ class ModelScopeService:
         """Temporarily bridge the bundled SDK's byte counter to the GUI."""
         import modelscope_hub._upload as upload_module
 
-        original_tqdm = upload_module.tqdm
+        with _SDK_UPLOAD_LOCK:
+            original_tqdm = upload_module.tqdm
 
-        def progress_factory(iterable=None, **kwargs):
-            return _CallbackTqdm(iterable, callback=callback, **kwargs)
+            def progress_factory(iterable=None, **kwargs):
+                return _CallbackTqdm(iterable, callback=callback, **kwargs)
 
-        upload_module.tqdm = progress_factory
-        try:
-            yield
-        finally:
-            upload_module.tqdm = original_tqdm
+            upload_module.tqdm = progress_factory
+            try:
+                yield
+            finally:
+                upload_module.tqdm = original_tqdm
 
     def upload_file(self, repo: Repository, local_path: Path, target_folder: str) -> Any:
         remote_path = normalize_remote_path(target_folder, local_path.name)
         return self.upload_file_as(repo, local_path, remote_path)
 
     def upload_file_as(self, repo: Repository, local_path: Path, remote_path: str) -> Any:
+        local_path = validate_upload_source(local_path)
         remote_path = normalize_remote_path(remote_path)
-        return self.api.upload_file(
-            repo.repo_id,
-            repo.repo_type,
-            str(local_path),
-            remote_path,
-            commit_message=f"Upload {local_path.name} via ModelScope Manager",
-            disable_tqdm=True,
-        )
+        with _SDK_UPLOAD_LOCK:
+            return self.api.upload_file(
+                repo.repo_id,
+                repo.repo_type,
+                str(local_path),
+                remote_path,
+                commit_message=f"Upload {local_path.name} via ModelScope Manager",
+                disable_tqdm=True,
+            )
 
     def upload_folder(
         self,
@@ -309,19 +313,21 @@ class ModelScopeService:
         keep_folder_name: bool = True,
         ignore_patterns: list[str] | None = None,
     ) -> Any:
+        local_path = validate_upload_source(local_path)
         remote_folder = normalize_remote_path(
             target_folder,
             local_path.name if keep_folder_name else "",
         )
-        return self.api.upload_folder(
-            repo.repo_id,
-            repo.repo_type,
-            str(local_path),
-            path_in_repo=remote_folder,
-            commit_message=f"Upload folder {local_path.name} via ModelScope Manager",
-            ignore_patterns=ignore_patterns,
-            disable_tqdm=True,
-        )
+        with _SDK_UPLOAD_LOCK:
+            return self.api.upload_folder(
+                repo.repo_id,
+                repo.repo_type,
+                str(local_path),
+                path_in_repo=remote_folder,
+                commit_message=f"Upload folder {local_path.name} via ModelScope Manager",
+                ignore_patterns=ignore_patterns,
+                disable_tqdm=True,
+            )
 
 
 class _ModelScopeCsrfAuth(AuthBase):
@@ -390,13 +396,15 @@ class MultiAccountService:
     ):
         self.services = dict(services)
         self.account_repositories = {key: list(value) for key, value in repositories.items()}
-        self._routes: dict[tuple[str, str], ModelScopeService] = {}
+        self._routes: dict[tuple[str, str], list[ModelScopeService]] = {}
         for account_id, repos in self.account_repositories.items():
             service = self.services.get(account_id)
             if not service:
                 continue
             for repo in repos:
-                self._routes.setdefault((repo.repo_type, repo.repo_id), service)
+                routes = self._routes.setdefault((repo.repo_type, repo.repo_id), [])
+                if service not in routes:
+                    routes.append(service)
         self.token = ""
 
     def list_repositories(self) -> list[Repository]:
@@ -406,11 +414,16 @@ class MultiAccountService:
                 output.setdefault((repo.repo_type, repo.repo_id), repo)
         return sorted(output.values(), key=lambda item: (item.repo_type, item.repo_id.lower()))
 
-    def _for(self, repo: Repository) -> ModelScopeService:
-        service = self._routes.get((repo.repo_type, repo.repo_id))
-        if service is None:
-            raise RuntimeError(f"No verified account can access {repo.repo_id}")
-        return service
+    def _for(self, repo: Repository, *, for_write: bool = False) -> ModelScopeService:
+        services = self._routes.get((repo.repo_type, repo.repo_id), [])
+        if for_write:
+            # Web-login services deliberately reject uploads. Prefer an actual
+            # Token SDK service when the same repository appears under both.
+            services = [service for service in services if str(getattr(service, "token", "") or "")]
+        if not services:
+            action = "write" if for_write else "access"
+            raise RuntimeError(f"No verified account can {action} {repo.repo_id}")
+        return services[0]
 
     def list_entries(self, repo: Repository) -> list[RemoteEntry]:
         return self._for(repo).list_entries(repo)
@@ -419,7 +432,7 @@ class MultiAccountService:
         return self._for(repo).get_download_url(repo, remote_path)
 
     def upload_file_as(self, repo: Repository, local_path: Path, remote_path: str) -> Any:
-        return self._for(repo).upload_file_as(repo, local_path, remote_path)
+        return self._for(repo, for_write=True).upload_file_as(repo, local_path, remote_path)
 
 
 def upload_paths(

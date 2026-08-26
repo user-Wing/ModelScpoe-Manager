@@ -189,6 +189,8 @@ def initialize_database(path: Path, legacy_folder_index: Path | None = None) -> 
                 enabled INTEGER NOT NULL DEFAULT 1,
                 last_scan INTEGER NOT NULL DEFAULT 0,
                 last_sync INTEGER NOT NULL DEFAULT 0,
+                last_attempt INTEGER NOT NULL DEFAULT 0,
+                last_success INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
@@ -228,6 +230,20 @@ def initialize_database(path: Path, legacy_folder_index: Path | None = None) -> 
             );
             CREATE INDEX IF NOT EXISTS entry_tags_tag ON entry_tags(tag_name);
             """
+        )
+        backup_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(backup_jobs)")}
+        if "last_attempt" not in backup_columns:
+            connection.execute("ALTER TABLE backup_jobs ADD COLUMN last_attempt INTEGER NOT NULL DEFAULT 0")
+        if "last_success" not in backup_columns:
+            connection.execute("ALTER TABLE backup_jobs ADD COLUMN last_success INTEGER NOT NULL DEFAULT 0")
+        connection.execute(
+            "UPDATE backup_jobs SET last_attempt=last_scan WHERE last_attempt=0 AND last_scan<>0"
+        )
+        connection.execute(
+            "UPDATE backup_jobs SET last_success=last_scan WHERE last_success=0 AND last_scan<>0"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS backup_jobs_attempt ON backup_jobs(enabled, last_attempt, last_success)"
         )
         connection.execute(
             """INSERT OR IGNORE INTO web_accounts
@@ -273,6 +289,26 @@ class AccountStore:
         connection.row_factory = sqlite3.Row
         return connection
 
+    def _upgrade_account_cipher(self, account_id: str, token: str) -> None:
+        """Rewrite legacy machine-scope account credentials with user DPAPI."""
+        cipher = protect(token)
+        connection = self._connect()
+        try:
+            connection.execute("UPDATE accounts SET token_cipher=? WHERE account_id=?", (cipher, account_id))
+            connection.commit()
+        finally:
+            connection.close()
+
+    def _upgrade_web_session_cipher(self, account_id: str, plaintext: str) -> None:
+        cipher = protect(plaintext)
+        connection = self._connect()
+        try:
+            connection.execute(
+                "UPDATE account_web_sessions SET session_cipher=? WHERE account_id=?", (cipher, account_id)
+            )
+            connection.commit()
+        finally:
+            connection.close()
     def _saved_token_count(self) -> int:
         connection = self._connect()
         try:
@@ -311,6 +347,14 @@ class AccountStore:
                         token = unprotect(cipher)
                     except Exception:
                         invalid_ids.append(str(row["account_id"]))
+                    else:
+                        if cipher.startswith("m:"):
+                            try:
+                                self._upgrade_account_cipher(str(row["account_id"]), token)
+                            except Exception:
+                                # The legacy machine-scope value is still usable; do not destroy it
+                                # merely because current-user DPAPI cannot rewrite it right now.
+                                pass
             output.append(AccountRecord(
                 str(row["account_id"]),
                 str(row["label"]),
@@ -481,10 +525,18 @@ class AccountStore:
             self.destroy_web_session(account_id)
             return None
         try:
-            return ModelScopeWebSession.from_dict(json.loads(unprotect(str(row["session_cipher"]))))
+            cipher = str(row["session_cipher"])
+            plaintext = unprotect(cipher)
+            session = ModelScopeWebSession.from_dict(json.loads(plaintext))
         except Exception:
             self.destroy_web_session(account_id)
             return None
+        if cipher.startswith("m:"):
+            try:
+                self._upgrade_web_session_cipher(account_id, plaintext)
+            except Exception:
+                pass
+        return session
 
     def destroy_web_session(self, account_id: str) -> None:
         connection = self._connect()

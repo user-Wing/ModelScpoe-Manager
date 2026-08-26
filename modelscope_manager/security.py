@@ -42,16 +42,21 @@ def _windows_api():
     return crypt32, kernel32
 
 
-def protect(text: str) -> str:
-    """Encrypt a token with Windows DPAPI."""
+def protect(text: str, *, allow_machine_fallback: bool = False) -> str:
+    """Encrypt sensitive text with Windows DPAPI.
+
+    Account Token and web-session callers use current-user scope only.  The
+    optional machine fallback is reserved for non-account compatibility data
+    such as the random device identifier and the LAN-only WebDAV password.
+    """
     if not text:
         return ""
     crypt32, kernel32 = _windows_api()
     last_error = 0
-    # Prefer current-user protection. Some portable/sandboxed Windows profiles do
-    # not expose a user DPAPI master key, so fall back to machine protection; the
-    # encrypted value is still stored only in the current user's settings hive.
-    for prefix, flags in (("u:", 1), ("m:", 5)):
+    candidates = [("u:", 1)]
+    if allow_machine_fallback:
+        candidates.append(("m:", 5))
+    for prefix, flags in candidates:
         source, keepalive = _blob(text.encode("utf-8"))
         target = DATA_BLOB()
         if crypt32.CryptProtectData(ctypes.byref(source), None, None, None, None, flags, ctypes.byref(target)):
@@ -63,6 +68,11 @@ def protect(text: str) -> str:
                 del keepalive
         last_error = ctypes.get_last_error()
     raise ctypes.WinError(last_error)
+
+
+def protect_compatible(text: str) -> str:
+    """Protect non-account compatibility data, allowing machine-scope fallback."""
+    return protect(text, allow_machine_fallback=True)
 
 
 def unprotect(value: str) -> str:

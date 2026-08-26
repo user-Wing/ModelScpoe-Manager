@@ -35,39 +35,29 @@ class DownloadPlanTests(unittest.TestCase):
 
 
 class VerificationTests(unittest.TestCase):
-    def test_adaptive_segments_are_written_per_file(self):
+    def test_adaptive_segments_are_applied_per_rpc_download(self):
         tuning = Aria2Tuning(1.0, 1, 32, 100.0, 64)
         runner = Aria2DownloadRunner(Path("aria2-next.exe"), "", tuning)
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            specs = [
-                DownloadSpec("small", root / "small", "https://example/small", 512 * 1024),
-                DownloadSpec("medium", root / "medium", "https://example/medium", 10 * 1024**2),
-                DownloadSpec("large", root / "large", "https://example/large", 100 * 1024**2),
-            ]
-            manifest = runner._write_manifest(specs)
-            content = manifest.read_text(encoding="utf-8")
-            manifest.unlink()
-        self.assertIn("split=1", content)
-        self.assertIn("split=32", content)
-        self.assertIn("split=64", content)
+        specs = [
+            DownloadSpec("small", Path("small"), "https://modelscope.cn/small", 512 * 1024),
+            DownloadSpec("medium", Path("medium"), "https://modelscope.cn/medium", 10 * 1024**2),
+            DownloadSpec("large", Path("large"), "https://modelscope.cn/large", 100 * 1024**2),
+        ]
+        self.assertEqual([runner._aria2_options(spec)["split"] for spec in specs], ["1", "32", "64"])
 
     def test_invalid_threshold_order_is_rejected(self):
         with self.assertRaises(ValueError):
             Aria2Tuning(100.0, 1, 32, 1.0, 64).validated()
 
-    def test_manifest_keeps_each_accounts_token_with_its_file(self):
+    def test_rpc_options_keep_each_accounts_token_with_its_file(self):
         runner = Aria2DownloadRunner(Path("aria2-next.exe"), "")
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            manifest = runner._write_manifest([
-                DownloadSpec("a", root / "a", "https://example/a", token="token-a"),
-                DownloadSpec("b", root / "b", "https://example/b", token="token-b"),
-            ])
-            content = manifest.read_text(encoding="utf-8")
-            manifest.unlink()
-        self.assertIn("Authorization: Bearer token-a", content)
-        self.assertIn("Authorization: Bearer token-b", content)
+        specs = [
+            DownloadSpec("a", Path("a"), "https://modelscope.cn/a", token="token-a"),
+            DownloadSpec("b", Path("b"), "https://modelscope.cn/b", token="token-b"),
+        ]
+        headers = [runner._aria2_options(spec)["header"] for spec in specs]
+        self.assertIn("Authorization: Bearer token-a", headers[0])
+        self.assertIn("Authorization: Bearer token-b", headers[1])
 
     def test_rpc_snapshot_uses_aria2_aggregate_speed(self):
         runner = Aria2DownloadRunner(Path("aria2-next.exe"), "")
@@ -90,7 +80,7 @@ class VerificationTests(unittest.TestCase):
         runner = Aria2DownloadRunner(Path("aria2-next.exe"), "")
         runner._rpc_port = 16800
         runner._rpc_secret = "secret"
-        command = runner._command(Path("input.txt"))
+        command = runner._command()
         self.assertIn("--enable-rpc=true", command)
         self.assertIn("--rpc-listen-all=false", command)
         self.assertIn("--pause=true", command)
@@ -102,7 +92,7 @@ class VerificationTests(unittest.TestCase):
         runner = Aria2DownloadRunner(Path("aria2-next.exe"), "", download_limit_supplier=lambda: limits[0])
         runner._rpc_port = 16800
         runner._rpc_secret = "secret"
-        command = runner._command(Path("input.txt"))
+        command = runner._command()
         self.assertIn("--max-overall-download-limit=2097152", command)
         runner._rpc = MagicMock()
         runner._apply_download_limit(force=True)

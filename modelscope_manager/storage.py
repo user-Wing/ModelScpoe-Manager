@@ -7,7 +7,7 @@ from typing import Callable
 
 from PySide6.QtCore import QSettings
 
-from .security import protect, unprotect
+from .security import protect, protect_compatible, unprotect
 
 
 APP_DIR = Path(__file__).resolve().parent.parent
@@ -48,7 +48,7 @@ class DeviceIdentity:
     def __init__(
         self,
         path: Path = DEVICE_ID_PATH,
-        protector: Callable[[str], str] = protect,
+        protector: Callable[[str], str] = protect_compatible,
         unprotector: Callable[[str], str] = unprotect,
     ):
         self.path = path

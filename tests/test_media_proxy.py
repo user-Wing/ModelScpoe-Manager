@@ -2,6 +2,7 @@ import threading
 import unittest
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import patch
 
 from modelscope_manager.media_proxy import AuthenticatedMediaProxy
 
@@ -34,10 +35,14 @@ class MediaProxyTests(unittest.TestCase):
         proxy = AuthenticatedMediaProxy()
         try:
             source = f"http://127.0.0.1:{upstream.server_port}/video.mp4"
-            request = urllib.request.Request(proxy.stream_url(source, "secret-token"), headers={"Range": "bytes=3-"})
-            with urllib.request.urlopen(request, timeout=3) as response:
-                self.assertEqual(response.status, 206)
-                self.assertEqual(response.read(), payload[3:])
+            with patch(
+                "modelscope_manager.media_proxy.modelscope_token_headers",
+                return_value={"Authorization": "Bearer secret-token", "Cookie": "m_session_id=secret-token"},
+            ):
+                request = urllib.request.Request(proxy.stream_url(source, "secret-token"), headers={"Range": "bytes=3-"})
+                with urllib.request.urlopen(request, timeout=3) as response:
+                    self.assertEqual(response.status, 206)
+                    self.assertEqual(response.read(), payload[3:])
             self.assertEqual(observed, {
                 "authorization": "Bearer secret-token",
                 "cookie": "m_session_id=secret-token",
@@ -79,9 +84,13 @@ class MediaProxyTests(unittest.TestCase):
             threading.Thread(target=server.serve_forever, daemon=True).start()
         proxy = AuthenticatedMediaProxy()
         try:
-            url = proxy.stream_url(f"http://127.0.0.1:{redirect.server_port}/file", "private")
-            with urllib.request.urlopen(url, timeout=3) as response:
-                self.assertEqual(response.read(), b"ok")
+            with patch(
+                "modelscope_manager.media_proxy.modelscope_token_headers",
+                return_value={"Authorization": "Bearer private", "Cookie": "m_session_id=private"},
+            ):
+                url = proxy.stream_url(f"http://127.0.0.1:{redirect.server_port}/file", "private")
+                with urllib.request.urlopen(url, timeout=3) as response:
+                    self.assertEqual(response.read(), b"ok")
             self.assertEqual(observed, {"authorization": None, "cookie": None})
         finally:
             proxy.stop()

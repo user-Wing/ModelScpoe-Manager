@@ -8,7 +8,8 @@ from PySide6.QtCore import QEvent, QMimeData, QPoint, QPointF, QSettings, Qt, QU
 from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent, QKeyEvent
 from PySide6.QtNetwork import QNetworkCookie
 from PySide6.QtWidgets import (
-    QApplication, QLabel, QListWidgetItem, QMessageBox, QPushButton, QTreeWidgetItem,
+    QApplication, QLabel, QListWidgetItem, QMessageBox, QPushButton, QTableWidget,
+    QTableWidgetItem, QTreeWidgetItem,
 )
 from qfluentwidgets import SettingCardGroup
 
@@ -19,10 +20,12 @@ from modelscope_manager.app import (
     THUMBNAIL_RENDER_SIZE, VIDEO_THUMBNAIL_SEEK_SECONDS,
     UploadQueueItem,
     breadcrumb_levels, copy_name, everything_search_match, find_available_port,
-    local_paths_size, repository_file_url, repository_is_public,
+    local_path_identity, local_paths_size, repository_file_url, repository_identity,
+    repository_is_public, running_download_percent,
     thumbnail_batch_policy,
 )
 from modelscope_manager.fluent_ui import ControlSettingCard, PanelSettingCard
+from modelscope_manager.download_service import DownloadSpec
 from modelscope_manager.service import RemoteEntry, Repository
 
 
@@ -81,10 +84,41 @@ class AppHelperTests(unittest.TestCase):
             "https://modelscope.cn/api/v1/datasets/ARXChem/Pictures-Share/repo?Revision=master&FilePath=README.md",
         )
 
+    def test_transfer_callback_identities_ignore_refresh_metadata_and_path_spelling(self):
+        before = Repository("alice/demo", "model", "private", "2026-08-24")
+        refreshed = Repository("alice/demo", "model", "private", "2026-08-25")
+        self.assertEqual(repository_identity(before), repository_identity(refreshed))
+        self.assertEqual(local_path_identity(r"C:\Downloads\File.bin"), local_path_identity(r"c:\downloads\file.bin"))
+
+    def test_running_download_progress_reserves_100_percent_for_completion(self):
+        self.assertEqual(running_download_percent(0, 100), 0)
+        self.assertEqual(running_download_percent(100, 100), 99)
+
+    def test_download_status_callback_updates_canonical_queue_path(self):
+        class Harness:
+            _download_item_update = MainWindow._download_item_update
+            _t = staticmethod(lambda text: text)
+            _tf = staticmethod(lambda text, **values: text.format(**values))
+
+        harness = Harness()
+        canonical = Path(r"C:\Downloads\File.bin")
+        harness.download_specs = [DownloadSpec("File.bin", canonical, "https://example.test/File.bin", 100)]
+        harness.download_states = {str(canonical): "waiting"}
+        harness.download_table = QTableWidget(1, 3)
+        harness.download_table.setItem(0, 2, QTableWidgetItem("等待下载"))
+        harness.backup_sync_job_paths = {}
+        harness.backup_jobs = []
+        harness.potplayer_install_archive = None
+
+        harness._download_item_update(r"c:\downloads\file.bin", "downloading", 25, 100, "下载中")
+
+        self.assertEqual(harness.download_states[str(canonical)], "downloading")
+        self.assertEqual(harness.download_table.item(0, 2).text(), "25% · 下载中")
+
     def test_repository_visibility_accepts_modelscope_numeric_public_value(self):
         self.assertTrue(repository_is_public(Repository("alice/public", "dataset", "5"), "token"))
         self.assertTrue(repository_is_public(Repository("alice/public", "dataset", "public"), "token"))
-        self.assertTrue(repository_is_public(Repository("alice/public", "dataset", ""), ""))
+        self.assertFalse(repository_is_public(Repository("alice/unknown", "dataset", ""), ""))
         self.assertFalse(repository_is_public(Repository("alice/private", "dataset", "1"), "token"))
         self.assertFalse(repository_is_public(Repository("alice/internal", "dataset", "3"), "token"))
         self.assertFalse(repository_is_public(Repository("alice/unknown", "dataset", ""), "token"))

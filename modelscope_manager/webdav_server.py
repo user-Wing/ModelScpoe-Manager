@@ -5,6 +5,7 @@ import email.utils
 import html
 import hmac
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -14,9 +15,10 @@ from pathlib import Path
 from typing import Callable
 from urllib.error import HTTPError
 from urllib.parse import quote, unquote, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from .folder_index import FolderSizeIndex
+from .http_security import modelscope_token_headers, safe_urlopen
 from .service import (
     MAX_MODEL_UPLOAD_FILE_SIZE,
     ModelScopeService,
@@ -25,6 +27,9 @@ from .service import (
     normalize_remote_path,
     repository_directories,
 )
+
+WEBDAV_MAX_CONCURRENT_UPLOADS = 2
+WEBDAV_MIN_FREE_BYTES = 512 * 1024**2
 
 
 @dataclass(frozen=True)
@@ -65,7 +70,34 @@ class ModelScopeWebDAV:
         self._repos_cache: dict[bool, tuple[float, list[Repository]]] = {}
         self._entries_cache: dict[tuple[bool, str, str], tuple[float, list[RemoteEntry]]] = {}
         self._virtual_dirs: set[tuple[str, str, str]] = set()
+        self._upload_slots = threading.BoundedSemaphore(WEBDAV_MAX_CONCURRENT_UPLOADS)
+        self._upload_guard = threading.Lock()
+        self._reserved_upload_bytes = 0
 
+    def reserve_upload(self, length: int) -> str | None:
+        """Reserve bounded local staging capacity for one authenticated PUT."""
+        if not self._upload_slots.acquire(blocking=False):
+            return "Too many concurrent uploads"
+        try:
+            with self._upload_guard:
+                free = shutil.disk_usage(tempfile.gettempdir()).free
+                available = max(0, free - WEBDAV_MIN_FREE_BYTES - self._reserved_upload_bytes)
+                if length > available:
+                    return "Insufficient temporary disk space"
+                self._reserved_upload_bytes += length
+            return None
+        except Exception:
+            self._upload_slots.release()
+            raise
+        finally:
+            # A rejected reservation never owns a slot.
+            if 'available' in locals() and length > available:
+                self._upload_slots.release()
+
+    def release_upload(self, length: int) -> None:
+        with self._upload_guard:
+            self._reserved_upload_bytes = max(0, self._reserved_upload_bytes - max(0, length))
+        self._upload_slots.release()
     @property
     def running(self) -> bool:
         return bool(self._thread and self._thread.is_alive())
@@ -461,14 +493,12 @@ class _WebDAVHandler(BaseHTTPRequestHandler):
                 self._error(404, "File not found")
                 return
             service = self.manager._service(public=node.public)
-            headers = {}
-            if service.token:
-                headers["Authorization"] = "Bearer " + service.token
-                headers["Cookie"] = "m_session_id=" + service.token
+            download_url = service.get_download_url(node.repo, node.remote_path)
+            headers = modelscope_token_headers(download_url, service.token, include_session_cookie=True)
             if self.headers.get("Range"):
                 headers["Range"] = self.headers["Range"]
-            request = Request(service.get_download_url(node.repo, node.remote_path), headers=headers)
-            response = urlopen(request, timeout=30)
+            request = Request(download_url, headers=headers)
+            response = safe_urlopen(request, timeout=30)
             status = getattr(response, "status", 200)
             self.send_response(status)
             for name in ("Content-Length", "Content-Type", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified"):
@@ -492,11 +522,19 @@ class _WebDAVHandler(BaseHTTPRequestHandler):
     def do_PUT(self):
         if not self._authorized():
             return
+        length = -1
+        reserved = False
         try:
             length = int(self.headers.get("Content-Length", "-1"))
             if length < 0:
                 self._error(411, "Content-Length is required")
                 return
+            reservation_error = self.manager.reserve_upload(length)
+            if reservation_error:
+                status = 507 if "disk" in reservation_error.lower() else 503
+                self._error(status, reservation_error)
+                return
+            reserved = True
             existed = self.manager.upload(self.path, self.rfile, length)
         except PermissionError as exc:
             self._error(403, str(exc))
@@ -507,6 +545,9 @@ class _WebDAVHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._error(502, str(exc))
             return
+        finally:
+            if reserved:
+                self.manager.release_upload(length)
         self.send_response(204 if existed else 201)
         self.send_header("Content-Length", "0")
         self.end_headers()

@@ -6,6 +6,8 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from .local_paths import iter_contained_files
+
 
 MAX_BACKUP_FILE_SIZE = 50 * 1024**3
 
@@ -26,6 +28,8 @@ class BackupJob:
     enabled: bool = True
     last_scan: int = 0
     last_sync: int = 0
+    last_attempt: int = 0
+    last_success: int = 0
 
     @property
     def interval_seconds(self) -> int:
@@ -58,6 +62,7 @@ class BackupStore:
             str(row["dest_dir"]), str(row["mode"]), float(row["interval_value"]),
             str(row["interval_unit"]), float(row["download_limit_mb"]),
             bool(row["enabled"]), int(row["last_scan"]), int(row["last_sync"]),
+            int(row["last_attempt"]), int(row["last_success"]),
         )
 
     def list_jobs(self) -> list[BackupJob]:
@@ -74,22 +79,24 @@ class BackupStore:
         connection = self._connect()
         try:
             existing = connection.execute(
-                "SELECT created_at, last_scan, last_sync FROM backup_jobs WHERE job_id=?", (job.job_id,)
+                "SELECT created_at, last_scan, last_sync, last_attempt, last_success FROM backup_jobs WHERE job_id=?", (job.job_id,)
             ).fetchone()
             created_at = int(existing[0]) if existing else now
             last_scan = int(existing[1]) if existing else int(job.last_scan)
             last_sync = int(existing[2]) if existing else int(job.last_sync)
+            last_attempt = int(existing[3]) if existing else int(job.last_attempt)
+            last_success = int(existing[4]) if existing else int(job.last_success)
             connection.execute(
                 """INSERT OR REPLACE INTO backup_jobs
                    (job_id, name, account_id, local_path, repo_type, repo_id, dest_dir,
                     mode, interval_value, interval_unit, download_limit_mb, enabled,
-                    last_scan, last_sync, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    last_scan, last_sync, last_attempt, last_success, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (job.job_id, job.name.strip() or Path(job.local_path).name or "备份任务",
                  job.account_id, str(Path(job.local_path).resolve()), job.repo_type, job.repo_id,
                  job.dest_dir.strip("/"), job.mode, max(0.01, float(job.interval_value)),
                  job.interval_unit, max(0.01, float(job.download_limit_mb)), int(job.enabled),
-                 last_scan, last_sync, created_at, now),
+                 last_scan, last_sync, last_attempt, last_success, created_at, now),
             )
             connection.commit()
         finally:
@@ -107,10 +114,20 @@ class BackupStore:
 
     def due_jobs(self, now: int | None = None) -> list[BackupJob]:
         now = int(now or time.time())
-        return [job for job in self.list_jobs() if job.enabled and now - job.last_scan >= job.interval_seconds]
+        output: list[BackupJob] = []
+        for job in self.list_jobs():
+            if not job.enabled:
+                continue
+            if job.last_attempt > job.last_success:
+                retry_after = min(300, max(30, job.interval_seconds // 6))
+                if now - job.last_attempt >= retry_after:
+                    output.append(job)
+            elif now - job.last_success >= job.interval_seconds:
+                output.append(job)
+        return output
 
     def scan_changes(self, job: BackupJob) -> tuple[list[LocalBackupFile], list[LocalBackupFile]]:
-        root = Path(job.local_path)
+        root = Path(job.local_path).resolve()
         if not root.is_dir():
             raise FileNotFoundError(f"备份文件夹不存在：{root}")
         connection = self._connect()
@@ -126,9 +143,7 @@ class BackupStore:
         changed: list[LocalBackupFile] = []
         oversized: list[LocalBackupFile] = []
         current_paths: set[str] = set()
-        for path in root.rglob("*"):
-            if not path.is_file():
-                continue
+        for path in iter_contained_files(root):
             try:
                 stat = path.stat()
             except OSError:
@@ -153,6 +168,17 @@ class BackupStore:
                 connection.close()
         return changed, oversized
 
+    def current_remote_paths(self, job_id: str) -> dict[str, str]:
+        """Return the latest successful remote object for each current local path."""
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT relative_path, remote_path FROM backup_files WHERE job_id=?", (job_id,)
+            ).fetchall()
+        finally:
+            connection.close()
+        return {str(row["relative_path"]): str(row["remote_path"]) for row in rows if row["remote_path"]}
+
     def mark_uploaded(self, job_id: str, item: LocalBackupFile, remote_path: str) -> None:
         connection = self._connect()
         try:
@@ -166,12 +192,24 @@ class BackupStore:
         finally:
             connection.close()
 
+    def mark_attempt(self, job_id: str, when: int | None = None) -> None:
+        stamp = int(when or time.time())
+        connection = self._connect()
+        try:
+            connection.execute(
+                "UPDATE backup_jobs SET last_attempt=?, updated_at=? WHERE job_id=?",
+                (stamp, int(time.time()), job_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
     def mark_scan(self, job_id: str, when: int | None = None) -> None:
         connection = self._connect()
         try:
             connection.execute(
-                "UPDATE backup_jobs SET last_scan=?, updated_at=? WHERE job_id=?",
-                (int(when or time.time()), int(time.time()), job_id),
+                "UPDATE backup_jobs SET last_scan=?, last_success=?, last_attempt=?, updated_at=? WHERE job_id=?",
+                (int(when or time.time()), int(when or time.time()), int(when or time.time()), int(time.time()), job_id),
             )
             connection.commit()
         finally:

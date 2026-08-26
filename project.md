@@ -44,13 +44,14 @@ GUI 的耗时工作通过 `QThread` 子类执行，主线程只负责界面、�
 | `THIRD_PARTY_NOTICES.md` | Python、PySide6、ModelScope SDK、aria2-next、7-Zip-zstd 等第三方许可和来源说明。 |
 | `V1.0.2更新日志.md` | V1.0.2 面向用户的简要功能、修复与使用说明。 |
 | `V1.0.3更新日志.md` | V1.0.3 面向用户的简要功能、修复与安全说明。 |
+| `V1.0.4更新日志.md` | V1.0.4 下载队列与上传拖放修复说明。 |
 | `project.md` | 本项目结构、约束、验证方式和更新日志；每次源码修改后追加摘要。 |
 
 ### 3.2 `modelscope_manager` Python 包（按文件名排序）
 
 | 文件 | 代码功能与边界 |
 |---|---|
-| `__init__.py` | 包标识和版本号，目前为 `1.0.3`。 |
+| `__init__.py` | 包标识和版本号，目前为 `1.0.4`。 |
 | `app.py` | 主应用编排层。创建 FluentWindow、导航页、Public/Token/网页登录账户仓库树、标签筛选、公开资源历史、可追加的上传队列、下载队列、备份、图床、播放器设置、托盘和 WebDAV 控制；定义后台线程。上传项保存独立目标路径，当前项可在 SDK 字节回调边界暂停、恢复或取消；网页登录仓库的删除、移动和重命名仍把上传阶段路由到 Token SDK。 |
 | `backup.py` | 备份任务数据模型和 SQLite 存储。按文件大小/修改时间识别新增或变更文件，支持增量时间戳目录、同路径覆盖所需的记录、周期到期判断和云端同步时间记录；单文件达到 50 GiB 时列为跳过项。 |
 | `database.py` | 主 SQLite 数据层。保存账户元数据及设备绑定加密 Token/网页登录会话、仓库缓存、远端条目、搜索索引、目录大小、备份任务/文件、图床记录和多标签映射；重新缓存仓库条目时会清理已消失路径的标签。 |
@@ -139,6 +140,23 @@ runtime\python.exe -s -m compileall -q main.py modelscope_manager tests
 每次修改源码、测试、部署脚本或用户可见行为后，在本文“更新日志”最前面追加一条：日期、修改文件、行为摘要、验证结果和剩余风险。若只做分析或未改文件，不追加虚假记录。修改 `README.md` 或依赖版本时，也应说明是否同步检查本文件中的约束。
 
 ## 7. 更新日志
+
+### 2026-08-25 — V1.0.4 下载显示与上传队列修复
+
+- `modelscope_manager/app.py`：下载表格为“本地位置”保留可见空间，下载运行阶段最多显示 99%，校验完成后再显示 100%；下载状态回调按 Windows 规范化路径定位表格行。上传期间拖放追加任务时，优先使用已锁定的上传会话，并按仓库类型和 ID 判断是否仍为同一仓库，不再受仓库更新时间等刷新元数据影响。
+- `modelscope_manager/__init__.py`、`modelscope_manager/app.py`、`README.md`：版本更新为 `1.0.4`；`V1.0.4更新日志.md` 同步面向用户的修复说明。
+- `tests/test_app_helpers.py`：覆盖仓库稳定身份、Windows 本地路径回调匹配，以及运行中进度不提前显示 100%。
+- 验证：相关 34 项及全量 115 项单元测试通过；`runtime\python.exe -s -m compileall -q main.py modelscope_manager tests`、版本导入冒烟和 `git diff --check` 通过。
+- 风险：未执行真实 ModelScope 上传或远端 aria2 下载，避免未经请求改动云端仓库；真实传输界面仍需进行一次人工可见行为确认。
+
+### 2026-08-25 — Repair 副本便携启动与风险修复回归验收
+
+- `runtime/`：从原始 `ModelScpoe-Manager` 的同版本便携运行时仅补回 Repair 副本缺失的 4037 个文件（约 209.87 MiB），不覆盖 Repair 已有文件；恢复 `unittest`、`pywin32_bootstrap`、Qt 资源及 `runtime/tools` 等启动和测试依赖。未修改或清理 `data/`、Token、Cookie、数据库和缓存。
+- `modelscope_manager/web_session.py`：网页登录请求继续使用绑定 `.modelscope.cn` 的 CookieJar，保留跨重定向 Cookie 域限制，同时恢复对既有 `requests.get/delete/post` 测试替身和调用边界的兼容。
+- `tests/test_app_helpers.py`、`tests/test_database.py`、`tests/test_download_service.py`、`tests/test_media_proxy.py`、`tests/test_web_session.py`：把旧断言更新为风险修复后的行为，覆盖未知 visibility fail-closed、严格 DPAPI 的隔离测试、aria2 JSON-RPC 内存注入凭据、非官方域不主动发送 Token，以及网页登录 Cookie 域。
+- `tests/test_http_security.py`、`tests/test_local_paths.py`：新增 ModelScope 官方域识别、仿冒域拒绝、跨 origin 重定向移除认证头并保留 Range，以及上传/备份链接类路径拒绝测试。
+- 验证：`runtime\python.exe -s -m unittest discover -s tests -p "test_*.py"` 全量 112 项通过；`runtime\python.exe -s -m compileall -q main.py modelscope_manager tests` 和 `git diff --check` 通过。离屏主入口稳定进入 Qt 事件循环；按 `start.bat` 的生产链路运行 `runtime\pythonw.exe main.py` 后保留 `ModelScope Manager` 可见窗口，用户完成人工确认并关闭窗口。
+- 风险：本轮没有执行真实 ModelScope 登录/删除、aria2 远端下载、AList WebDAV PUT 或远端备份恢复，以避免未经请求地读写云端资源；全量测试仍会输出既有的临时数据库异步搜索 `no such table: entries` 清理竞态堆栈，但最终结果为 `OK`。
 
 ### 2026-08-25 — V1.0.3 源码发布准备
 

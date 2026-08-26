@@ -9,6 +9,8 @@ from urllib.parse import urlsplit
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from .http_security import modelscope_token_headers
+
 
 @dataclass
 class _Route:
@@ -61,11 +63,8 @@ class AuthenticatedMediaProxy:
                 if route is None:
                     self.send_error(404)
                     return
-                headers = {
-                    "Authorization": f"Bearer {route.token}",
-                    "Cookie": f"m_session_id={route.token}",
-                    "User-Agent": "ModelScope-Manager/1.0 PotPlayer",
-                }
+                headers = modelscope_token_headers(route.url, route.token, include_session_cookie=True)
+                headers["User-Agent"] = "ModelScope-Manager/1.0 PotPlayer"
                 if self.headers.get("Range"):
                     headers["Range"] = self.headers["Range"]
                 request = urllib.request.Request(

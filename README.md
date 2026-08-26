@@ -1,4 +1,4 @@
-# ModelScope Manager 1.0.3
+# ModelScope Manager 1.0.4
 
 Windows 桌面端 ModelScope 仓库资源管理器，使用官方 `modelscope-hub` Python SDK。
 

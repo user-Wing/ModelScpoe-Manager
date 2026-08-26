@@ -6,7 +6,6 @@ import json
 import os
 import socket
 import subprocess
-import tempfile
 import threading
 import time
 import uuid
@@ -14,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable
 
+from .http_security import modelscope_token_headers
 from .service import ModelScopeService, RemoteEntry, Repository
 
 
@@ -237,14 +237,13 @@ class Aria2DownloadRunner:
             spec.local_path.parent.mkdir(parents=True, exist_ok=True)
             item_callback(spec, "waiting", self._local_size(spec), spec.size, "等待下载")
 
-        manifest_path = self._write_manifest(specs)
         process: subprocess.Popen | None = None
         try:
             self._rpc_port = self._available_port()
             self._rpc_secret = uuid.uuid4().hex
             self._current_specs = list(specs)
             process = subprocess.Popen(
-                self._command(manifest_path),
+                self._command(),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -255,6 +254,7 @@ class Aria2DownloadRunner:
                 self._paused = False
                 self._stop_requested = False
             self._wait_for_rpc(process)
+            self._enqueue_specs(specs)
             self._apply_download_limit(force=True)
             self._rpc("unpauseAll")
             total = max(1, sum(max(0, spec.size) for spec in specs))
@@ -304,40 +304,39 @@ class Aria2DownloadRunner:
             with self._lock:
                 self._process = None
                 self._paused = False
-            try:
-                manifest_path.unlink(missing_ok=True)
-            except OSError:
-                pass
 
-    def _write_manifest(self, specs: list[DownloadSpec]) -> Path:
-        handle = tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            suffix=".aria2-input",
-            prefix="modelscope-manager-",
-            delete=False,
-        )
-        with handle:
-            for spec in specs:
-                handle.write(spec.url + "\n")
-                handle.write(f"  dir={spec.local_path.parent.as_posix()}\n")
-                handle.write(f"  out={spec.local_path.name}\n")
-                segments = self.tuning.segments_for(spec.size)
-                handle.write(f"  split={segments}\n")
-                handle.write(f"  max-connection-per-server={segments}\n")
-                if spec.sha256:
-                    handle.write(f"  checksum=sha-256={spec.sha256}\n")
-                token = spec.token or self.token
-                if token:
-                    handle.write(f"  header=Authorization: Bearer {token}\n")
-                    handle.write(f"  header=Cookie: m_session_id={token}\n")
-        return Path(handle.name)
+    def _enqueue_specs(self, specs: list[DownloadSpec]) -> None:
+        """Add downloads over loopback RPC so account credentials never touch disk."""
+        for spec in specs:
+            self._rpc("addUri", [[spec.url], self._aria2_options(spec)])
 
-    def _command(self, manifest_path: Path) -> list[str]:
+    def _aria2_options(self, spec: DownloadSpec) -> dict:
+        segments = self.tuning.segments_for(spec.size)
+        options = {
+            "dir": str(spec.local_path.parent),
+            "out": spec.local_path.name,
+            "continue": "true",
+            "allow-overwrite": "true",
+            "auto-file-renaming": "false",
+            "file-allocation": "none",
+            "check-integrity": "true",
+            "split": str(segments),
+            "max-connection-per-server": str(segments),
+            "pause": "true",
+        }
+        if spec.sha256:
+            options["checksum"] = f"sha-256={spec.sha256}"
+        token = spec.token or self.token
+        headers = modelscope_token_headers(spec.url, token, include_session_cookie=True)
+        if headers:
+            options["header"] = [f"{name}: {value}" for name, value in headers.items()]
+        return options
+
+    def _command(self) -> list[str]:
         connection_budget = 64
         concurrent = 0
         used_connections = 0
-        # aria2 processes the input file in order. Keep enough small-file tasks
+        # Keep enough small-file tasks active to fill the connection budget
         # active to fill the connection budget without multiplying large-file splits.
         # A minimum of three tasks prevents metadata-heavy repositories from idling.
         for spec in getattr(self, "_current_specs", []):
@@ -349,7 +348,6 @@ class Aria2DownloadRunner:
         concurrent = max(3, concurrent)
         command = [
             str(self.executable),
-            f"--input-file={manifest_path}",
             "--continue=true",
             "--allow-overwrite=true",
             "--auto-file-renaming=false",

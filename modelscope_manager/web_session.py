@@ -14,6 +14,16 @@ MODELSCOPE_ORIGIN = "https://www.modelscope.cn"
 DELETE_BATCH_SIZE = 100
 
 
+def _request(web_session: "ModelScopeWebSession", method: str, url: str, **kwargs) -> requests.Response:
+    """Send a web-session request with cookies scoped to ModelScope domains."""
+    kwargs.pop("cookies", None)
+    cookies = requests.cookies.RequestsCookieJar()
+    for name, value in web_session.cookies().items():
+        cookies.set(name, value, domain=".modelscope.cn", path="/")
+    request = getattr(requests, method.lower())
+    return request(url, cookies=cookies, **kwargs)
+
+
 @dataclass(frozen=True)
 class ModelScopeWebSession:
     m_session_id: str
@@ -53,10 +63,9 @@ class ModelScopeWebSession:
 
 
 def fetch_web_user_info(session: ModelScopeWebSession, timeout: int = 20) -> dict:
-    response = requests.get(
+    response = _request(session, "GET",
         f"{MODELSCOPE_ORIGIN}/api/v1/users/info",
         headers=session.headers(f"{MODELSCOPE_ORIGIN}/my/overview"),
-        cookies=session.cookies(),
         timeout=timeout,
     )
     response.raise_for_status()
@@ -92,11 +101,10 @@ def delete_repository_file(
     if repo_type == "model":
         params["Revision"] = "master"
     referer = f"{MODELSCOPE_ORIGIN}/{kind}/{repo_id}/tree/master/{file_path.rsplit('/', 1)[0]}"
-    response = requests.delete(
+    response = _request(session, "DELETE",
         f"{MODELSCOPE_ORIGIN}/api/v1/{kind}/{repo_id}/{endpoint}",
         params=params,
         headers=session.headers(referer),
-        cookies=session.cookies(),
         timeout=timeout,
     )
     response.raise_for_status()
@@ -126,11 +134,10 @@ def delete_repository_files(
         }
         for path in paths
     ]
-    response = requests.post(
+    response = _request(session, "POST",
         f"{MODELSCOPE_ORIGIN}/api/v1/repos/{kind}/{repo_id}/commit/master",
         json={"commit_message": "Delete files via ModelScope Manager", "actions": actions},
         headers=session.headers(f"{MODELSCOPE_ORIGIN}/{kind}/{repo_id}/files"),
-        cookies=session.cookies(),
         timeout=timeout,
     )
     response.raise_for_status()
@@ -160,11 +167,10 @@ def list_repository_file_paths(
         params = {"Revision": "master", "Recursive": "True", "PageNumber": page, "PageSize": 100}
         if root_path:
             params["Root"] = root_path
-        response = requests.get(
+        response = _request(session, "GET",
             f"{MODELSCOPE_ORIGIN}/api/v1/{kind}/{repo_id}/{suffix}",
             params=params,
             headers=session.headers(f"{MODELSCOPE_ORIGIN}/{kind}/{repo_id}/files"),
-            cookies=session.cookies(),
             timeout=timeout,
         )
         response.raise_for_status()

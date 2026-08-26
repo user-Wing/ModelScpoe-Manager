@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import posixpath
 import re
 import secrets
@@ -20,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from PySide6.QtCore import (
     QEvent, QProcess,
@@ -86,6 +87,7 @@ from qfluentwidgets import (
 )
 
 from .security import protect, unprotect
+from .http_security import modelscope_token_headers, safe_urlopen
 from .download_service import Aria2DownloadRunner, Aria2Tuning, DownloadSpec, build_download_specs
 from .backup import BackupJob, BackupStore, LocalBackupFile
 from .database import (
@@ -96,6 +98,7 @@ from .folder_index import FolderSizeIndex
 from .fluent_ui import CleanComboBox, ControlSettingCard, FluentSwitchButton, PanelSettingCard
 from .image_bed import IMAGE_EXTENSIONS, ImageRecord, ImageStore
 from .localization import LocaleManager
+from .local_paths import iter_contained_files
 from .media_proxy import AuthenticatedMediaProxy
 from .player_installer import (
     POTPLAYER_ARCHIVE_SHA256,
@@ -185,7 +188,23 @@ def repository_is_public(repo: Repository, service_token: str = "") -> bool:
         return True
     if visibility in {"private", "internal", "1", "3"}:
         return False
-    return not service_token
+    # Unknown/new visibility values fail closed; never infer public from missing credentials.
+    return False
+
+
+def repository_identity(repo: Repository) -> tuple[str, str]:
+    """Return the stable fields that identify a repository across refreshes."""
+    return repo.repo_type, repo.repo_id
+
+
+def local_path_identity(path: str | Path) -> str:
+    """Normalize Windows path spelling for transfer-row callback matching."""
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def running_download_percent(completed: int, total: int) -> int:
+    """Reserve 100% for the download-completed callback."""
+    return min(99, int(completed * 100 / max(1, total)))
 
 
 def is_supported_image_file(path: Path) -> bool:
@@ -444,8 +463,8 @@ class ThumbnailThread(QThread):
                 creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
                 command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
                 if Path(entry.path).suffix.lower() in IMAGE_EXTENSIONS:
-                    headers = {"Authorization": f"Bearer {self.service.token}"} if self.service.token else {}
-                    with urlopen(Request(url, headers=headers), timeout=20) as response:
+                    headers = modelscope_token_headers(url, self.service.token, include_session_cookie=True)
+                    with safe_urlopen(Request(url, headers=headers), timeout=20) as response:
                         image_bytes = response.read()
                     subprocess.run(command + ["-f", "image2pipe", "-i", "pipe:0", "-frames:v", "1", "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black", "-q:v", "3", str(target)], input=image_bytes, capture_output=True, timeout=45, check=True, creationflags=creationflags)
                 else:
@@ -496,9 +515,10 @@ class CopyThread(QThread):
                     if hasattr(self.source_service, "download_to_file"):
                         self.source_service.download_to_file(self.source_repo, entry.path, local)
                     else:
-                        headers = {"Authorization": f"Bearer {self.source_service.token}"} if self.source_service.token else {}
-                        request = Request(self.source_service.get_download_url(self.source_repo, entry.path), headers=headers)
-                        with urlopen(request, timeout=30) as response, local.open("wb") as output:
+                        download_url = self.source_service.get_download_url(self.source_repo, entry.path)
+                        headers = modelscope_token_headers(download_url, self.source_service.token, include_session_cookie=True)
+                        request = Request(download_url, headers=headers)
+                        with safe_urlopen(request, timeout=30) as response, local.open("wb") as output:
                             while chunk := response.read(1024 * 1024):
                                 output.write(chunk)
                     target = normalize_remote_path(self.destination_folder, base if self.selected.is_dir else "", relative)
@@ -662,7 +682,11 @@ class UploadThread(QThread):
 
     def run(self) -> None:
         path = self.item.path
-        item_size = self._path_size(path, self.skipped_files)
+        try:
+            item_size = self._path_size(path, self.skipped_files)
+        except Exception as exc:
+            self.item_done.emit(str(path), False, str(exc))
+            return
         started = time.monotonic()
         last_speed_time = started
         last_speed_bytes = 0
@@ -736,23 +760,14 @@ class UploadThread(QThread):
     @staticmethod
     def _path_size(path: Path, skipped_files: set[Path] | None = None) -> int:
         skipped_files = skipped_files or set()
-        if path.is_file():
-            if path.resolve() in skipped_files:
-                return 0
-            try:
-                return max(1, path.stat().st_size)
-            except OSError:
-                return 1
         total = 0
-        if path.is_dir():
-            for child in path.rglob("*"):
-                if child.is_file():
-                    if child.resolve() in skipped_files:
-                        continue
-                    try:
-                        total += child.stat().st_size
-                    except OSError:
-                        total += 1
+        for child in iter_contained_files(path):
+            if child.resolve() in skipped_files:
+                continue
+            try:
+                total += child.stat().st_size
+            except OSError:
+                total += 1
         return max(1, total)
 
 
@@ -822,10 +837,11 @@ class BackupThread(QThread):
 
     def run(self) -> None:
         uploaded = failed = 0
+        interrupted = False
+        self.store.mark_attempt(self.job.job_id)
         try:
             changed, oversized = self.store.scan_changes(self.job)
         except Exception as exc:
-            self.store.mark_scan(self.job.job_id)
             self.item_done.emit(self.job.local_path, False, str(exc))
             self.completed.emit(self.job.job_id, 0, 1, 0)
             return
@@ -839,10 +855,17 @@ class BackupThread(QThread):
         started = time.monotonic()
         for item in changed:
             if self.isInterruptionRequested():
+                interrupted = True
                 break
             remote_path = normalize_remote_path(prefix, item.relative_path)
             try:
+                before = item.path.stat()
+                if (int(before.st_size), int(before.st_mtime_ns)) != (item.size, item.mtime_ns):
+                    raise RuntimeError("文件在扫描后发生变化，将在下一轮重试")
                 self.service.upload_file_as(self.repo, item.path, remote_path)
+                after = item.path.stat()
+                if (int(after.st_size), int(after.st_mtime_ns)) != (item.size, item.mtime_ns):
+                    raise RuntimeError("文件在上传期间发生变化，将在下一轮重新上传")
                 self.store.mark_uploaded(self.job.job_id, item, remote_path)
             except Exception as exc:
                 failed += 1
@@ -855,7 +878,8 @@ class BackupThread(QThread):
             speed = completed_bytes / elapsed
             eta = int((total - completed_bytes) / speed) if speed > 0 else -1
             self.progress_info.emit(completed_bytes, total, speed, eta)
-        self.store.mark_scan(self.job.job_id)
+        if not failed and not interrupted:
+            self.store.mark_scan(self.job.job_id)
         self.completed.emit(self.job.job_id, uploaded, failed, len(oversized))
 
 
@@ -1256,6 +1280,7 @@ class MainWindow(FluentWindow):
         self.accounts: list[AccountRecord] = []
         self.web_accounts: list[WebAccountRecord] = []
         self.session_tokens: dict[str, str] = {}
+        self.session_web_sessions: dict[str, ModelScopeWebSession] = {}
         self.account_services: dict[str, ModelScopeService] = {}
         self.account_repositories: dict[str, list[Repository]] = {}
         self.active_account_id: str | None = None
@@ -1376,7 +1401,7 @@ class MainWindow(FluentWindow):
         self.navigationInterface.setAcrylicEnabled(True)
         self.status_bar = QStatusBar(self)
         self.status_bar.setObjectName("fluentStatusBar")
-        self.status_bar.showMessage("ModelScope Manager 1.0.3")
+        self.status_bar.showMessage("ModelScope Manager 1.0.4")
         self.widgetLayout.removeWidget(self.stackedWidget)
         content_layout = QVBoxLayout()
         content_layout.setContentsMargins(0, 0, 0, 0)
@@ -1656,11 +1681,12 @@ class MainWindow(FluentWindow):
         self.download_table = QTableWidget(0, 3)
         self.download_table.setHorizontalHeaderLabels(["远端资源", "本地位置", "状态"])
         download_header = self.download_table.horizontalHeader()
-        download_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        download_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        download_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        download_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         download_header.setMinimumSectionSize(80)
-        download_header.setStretchLastSection(True)
-        self.download_table.setColumnWidth(0, 300)
-        self.download_table.setColumnWidth(1, 420)
+        download_header.setStretchLastSection(False)
+        self.download_table.setColumnWidth(2, 180)
         self.download_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.download_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         download_layout.addWidget(self.download_table, 1)
@@ -2812,7 +2838,7 @@ class MainWindow(FluentWindow):
             username_item = QTableWidgetItem(account.username or "--")
             username_item.setFlags(username_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             table.setItem(row, 1, username_item)
-            status = "成功" if self.account_store.load_web_session(account.account_id) else "尚未登录"
+            status = "成功" if (self.session_web_sessions.get(account.account_id) or self.account_store.load_web_session(account.account_id)) else "尚未登录"
             status_item = QTableWidgetItem(status)
             status_item.setFlags(status_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             table.setItem(row, 2, status_item)
@@ -2861,6 +2887,7 @@ class MainWindow(FluentWindow):
             return
         key = self._web_account_key(account.account_id)
         self.account_store.remove_web_account(account.account_id)
+        self.session_web_sessions.pop(account.account_id, None)
         self.web_accounts = [value for value in self.web_accounts if value.account_id != account.account_id]
         self.account_services.pop(key, None)
         self.account_repositories.pop(key, None)
@@ -2894,10 +2921,27 @@ class MainWindow(FluentWindow):
         account.username = web_username
         account.status = "connected"
         self.account_store.save_web_account(account)
-        self.account_store.save_web_session(account_id, session)
+        persisted = True
+        try:
+            self.account_store.save_web_session(account_id, session)
+        except Exception as exc:
+            persisted = False
+            self.session_web_sessions[account_id] = session
+            self._log(f"网页登录信息无法使用当前用户 DPAPI 保存，仅本次运行有效：{exc}")
+        else:
+            self.session_web_sessions.pop(account_id, None)
         self._render_web_accounts()
-        self._log(f"网页登录信息已安全保存：{account.label}")
-        QMessageBox.information(self, self._t("在线登录成功"), self._t("网页登录信息已使用设备绑定加密保存。"))
+        if persisted:
+            self._log(f"网页登录信息已安全保存：{account.label}")
+            QMessageBox.information(
+                self, self._t("在线登录成功"),
+                self._t("网页登录信息已使用当前用户 DPAPI 加密保存。"),
+            )
+        else:
+            QMessageBox.warning(
+                self, self._t("在线登录成功"),
+                self._t("登录已在本次运行中启用，但当前用户 DPAPI 不可用，因此网页登录信息不会持久保存。"),
+            )
         QTimer.singleShot(0, self.load_repositories)
 
     def add_account(self) -> None:
@@ -3418,32 +3462,55 @@ class MainWindow(FluentWindow):
         base = job.dest_dir.strip("/")
         candidates: list[tuple[RemoteEntry, str]] = []
         if job.mode == "incremental":
-            timestamps: set[str] = set()
-            for entry in entries:
-                path = entry.path.strip("/")
-                relative = path[len(base) + 1:] if base and path.startswith(base + "/") else (path if not base else "")
-                first = relative.split("/", 1)[0] if relative else ""
-                if re.fullmatch(r"\d{8}-\d{6}", first):
-                    timestamps.add(first)
-            if not timestamps:
-                QMessageBox.information(self, self._t("没有云端备份"), self._t("目标目录中没有时间戳备份。"))
-                return
-            latest = max(timestamps)
-            prefix = normalize_remote_path(base, latest)
+            # New incremental tasks can restore the complete current state even though
+            # unchanged files live in older timestamp directories.  The local backup
+            # index maps every current relative path to its latest successful upload.
+            remote_paths = self.backup_store.current_remote_paths(job.job_id)
+            by_remote_path = {entry.path.strip("/"): entry for entry in entries if not entry.is_dir}
+            if remote_paths:
+                for relative, remote_path in remote_paths.items():
+                    entry = by_remote_path.get(remote_path.strip("/"))
+                    if entry is not None and entry.size <= int(job.download_limit_mb * 1024**2):
+                        candidates.append((entry, relative))
+            else:
+                # Compatibility fallback for legacy/imported tasks whose local index
+                # predates the current-path mapping: retain the original latest-delta behavior.
+                timestamps: set[str] = set()
+                for entry in entries:
+                    path = entry.path.strip("/")
+                    relative = path[len(base) + 1:] if base and path.startswith(base + "/") else (path if not base else "")
+                    first = relative.split("/", 1)[0] if relative else ""
+                    if re.fullmatch(r"\d{8}-\d{6}", first):
+                        timestamps.add(first)
+                if not timestamps:
+                    QMessageBox.information(self, self._t("没有云端备份"), self._t("目标目录中没有时间戳备份。"))
+                    return
+                latest = max(timestamps)
+                prefix = normalize_remote_path(base, latest)
+                for entry in entries:
+                    if entry.is_dir or entry.size > int(job.download_limit_mb * 1024**2):
+                        continue
+                    path = entry.path.strip("/")
+                    if not path.startswith(prefix + "/"):
+                        continue
+                    relative = path[len(prefix) + 1:]
+                    if relative:
+                        candidates.append((entry, relative))
         else:
             prefix = base
-        for entry in entries:
-            if entry.is_dir or entry.size > int(job.download_limit_mb * 1024**2):
-                continue
-            path = entry.path.strip("/")
-            if prefix:
-                if not path.startswith(prefix + "/"):
+            for entry in entries:
+                if entry.is_dir or entry.size > int(job.download_limit_mb * 1024**2):
                     continue
-                relative = path[len(prefix) + 1:]
-            else:
-                relative = path
-            if relative:
-                candidates.append((entry, relative))
+                path = entry.path.strip("/")
+                if prefix:
+                    if not path.startswith(prefix + "/"):
+                        continue
+                    relative = path[len(prefix) + 1:]
+                else:
+                    relative = path
+                if relative:
+                    candidates.append((entry, relative))
+
         root = Path(job.local_path).resolve()
         specs: list[DownloadSpec] = []
         for entry, relative in candidates:
@@ -4501,7 +4568,7 @@ class MainWindow(FluentWindow):
         self.settings.setValue("alist/port", self.alist_port.value())
         self.settings.setValue("alist/username", self.alist_username.text().strip())
         try:
-            self.settings.setValue("alist/password", protect(self.alist_password.text()))
+            self.settings.setValue("alist/password", protect(self.alist_password.text(), allow_machine_fallback=True))
         except Exception as exc:
             self._log(f"AList 密码未能安全保存：{exc}")
 
@@ -4749,7 +4816,18 @@ class MainWindow(FluentWindow):
             account.token = token
             account.remember = remember
             account.status = "connected"
-        self.account_store.save(account)
+        try:
+            self.account_store.save(account)
+        except Exception as exc:
+            if not remember:
+                raise
+            account.remember = False
+            self.account_store.save(account)
+            QMessageBox.warning(
+                self, self._t("令牌已连接"),
+                self._t("当前用户 DPAPI 不可用，Token 仅保留在本次运行内存中，不会写入磁盘。"),
+            )
+            self._log(f"Token 安全持久化失败，已降级为仅本次运行：{exc}")
         self.session_tokens[account.account_id] = token
         self.account_services[account.account_id] = service
         self.active_account_id = account.account_id
@@ -4778,9 +4856,9 @@ class MainWindow(FluentWindow):
             if account.enabled and self.session_tokens.get(account.account_id, account.token)
         }
         web_sessions = {
-            self._web_account_key(account.account_id): self.account_store.load_web_session(account.account_id)
+            self._web_account_key(account.account_id): session
             for account in self.web_accounts
-            if self.account_store.load_web_session(account.account_id)
+            if (session := self._web_session_for_key(self._web_account_key(account.account_id))) is not None
         }
         if not account_tokens and not web_sessions:
             self._prompt_for_settings()
@@ -5719,7 +5797,8 @@ class MainWindow(FluentWindow):
     def _web_session_for_key(self, account_key: str) -> ModelScopeWebSession | None:
         if not account_key.startswith("web:"):
             return None
-        return self.account_store.load_web_session(account_key.removeprefix("web:"))
+        account_id = account_key.removeprefix("web:")
+        return self.session_web_sessions.get(account_id) or self.account_store.load_web_session(account_id)
 
     def _delete_remote_entry(
         self, account_key: str, repo: Repository, entry: RemoteEntry, entries: list[RemoteEntry],
@@ -6221,7 +6300,7 @@ class MainWindow(FluentWindow):
         if self.selected_repo_public:
             QMessageBox.information(self, "Public", "Public 仓库为只读挂载，不能上传。")
             return
-        if not self.service:
+        if not self.service and not self.upload_session_service:
             self._prompt_for_settings()
             return
         if not self.selected_repo:
@@ -6230,7 +6309,10 @@ class MainWindow(FluentWindow):
         if self.task and self.task.isRunning() and not isinstance(self.task, UploadThread):
             QMessageBox.information(self, self._t("传输进行中"), self._t("已有任务正在运行，请完成后再拖放上传。"))
             return
-        if self.upload_session_repo and self.upload_session_repo != self.selected_repo:
+        if (
+            self.upload_session_repo
+            and repository_identity(self.upload_session_repo) != repository_identity(self.selected_repo)
+        ):
             QMessageBox.information(self, self._t("传输进行中"), "请在当前上传队列完成后再切换目标仓库。")
             return
         self.target_edit.setText(directory.path)
@@ -6514,7 +6596,18 @@ class MainWindow(FluentWindow):
             return
         if not self.upload_session_service or not self.upload_session_repo:
             return
-        oversized = set(oversized_upload_files([item.path])) if self.upload_session_repo.repo_type == "model" else set()
+        try:
+            oversized = set(oversized_upload_files([item.path])) if self.upload_session_repo.repo_type == "model" else set()
+            if self.upload_session_repo.repo_type != "model":
+                # Validate dataset folders too; size filtering is model-only, path containment is not.
+                for _ in iter_contained_files(item.path):
+                    pass
+        except Exception as exc:
+            self._set_upload_status(item, "failed", message=str(exc))
+            self.upload_failed += 1
+            self._log(f"上传路径被拒绝：{item.path} · {exc}")
+            QTimer.singleShot(0, self._start_next_upload)
+            return
         if item.path.is_file() and item.path.resolve() in oversized:
             self._set_upload_status(item, "skipped")
             self.upload_failed += 1
@@ -6731,15 +6824,20 @@ class MainWindow(FluentWindow):
 
     def _download_progress_info(self, completed: int, total: int, speed: float, eta: int) -> None:
         self.current_download_speed = max(0.0, speed)
-        percent = int(completed * 100 / max(1, total))
-        self.download_progress.setValue(min(100, percent))
+        percent = running_download_percent(completed, total)
+        # Completion owns the 100% state.  A running snapshot may briefly report
+        # all bytes before aria2 and checksum verification have actually finished.
+        self.download_progress.setValue(percent)
         self.download_stats.setText(self._tf("速度：{speed} · 剩余：{eta}", speed=format_speed(speed), eta=format_eta(eta)))
 
     def _download_item_update(self, local_path: str, state: str, completed: int, total: int, message: str) -> None:
-        self.download_states[local_path] = state
         for row, spec in enumerate(self.download_specs):
-            if str(spec.local_path) != local_path:
+            if local_path_identity(spec.local_path) != local_path_identity(local_path):
                 continue
+            canonical_path = str(spec.local_path)
+            self.download_states[canonical_path] = state
+            if local_path != canonical_path:
+                self.download_states.pop(local_path, None)
             status = self.download_table.item(row, 2)
             percent = int(completed * 100 / total) if total > 0 else 0
             labels = {
@@ -6756,10 +6854,12 @@ class MainWindow(FluentWindow):
             if state in {"completed", "failed", "stopped"}:
                 color = "#0f7b0f" if state == "completed" else ("#9a6700" if state == "stopped" else "#c42b1c")
                 status.setForeground(QColor(color))
+            else:
+                status.setForeground(self.download_table.palette().color(QPalette.ColorRole.Text))
             if state == "completed":
-                job_id = self.backup_sync_job_paths.pop(local_path, "")
+                job_id = self.backup_sync_job_paths.pop(canonical_path, "")
                 job = next((candidate for candidate in self.backup_jobs if candidate.job_id == job_id), None)
-                local_file = Path(local_path)
+                local_file = spec.local_path
                 if job and local_file.is_file():
                     try:
                         stat = local_file.stat()

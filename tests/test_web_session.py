@@ -39,6 +39,10 @@ class WebSessionTests(unittest.TestCase):
         self.assertEqual(fetch_web_user_info(self.session)["Username"], "alice")
         kwargs = request.call_args.kwargs
         self.assertEqual(kwargs["cookies"]["m_session_id"], "web")
+        self.assertEqual(
+            kwargs["cookies"].get_dict(domain=".modelscope.cn"),
+            self.session.cookies(),
+        )
         self.assertEqual(kwargs["headers"]["Origin"], "https://www.modelscope.cn")
 
     @patch("modelscope_manager.web_session.requests.delete")

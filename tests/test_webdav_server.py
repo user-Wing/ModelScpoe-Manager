@@ -3,6 +3,7 @@ import http.client
 import socket
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from modelscope_manager.folder_index import FolderSizeIndex
@@ -83,6 +84,33 @@ class WebDAVTests(unittest.TestCase):
         self.assertIn(b"models", body)
         self.assertIn(b"datasets", body)
         self.assertIn(b"public", body)
+
+    def test_unauthorized_propfind_closes_connection(self):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)
+        try:
+            connection.request(
+                "PROPFIND",
+                "/",
+                body=b'<?xml version="1.0"?><propfind xmlns="DAV:"/>',
+                headers={"Content-Type": "application/xml"},
+            )
+            response = connection.getresponse()
+            self.assertEqual(response.status, 401)
+            self.assertEqual(response.getheader("Connection"), "close")
+            response.read()
+        finally:
+            connection.close()
+
+    def test_dav_endpoint_preserves_prefix_for_subdirectory_mount(self):
+        status, body = self.request("PROPFIND", "/dav/public", headers={"Depth": "1"})
+
+        self.assertEqual(status, 207)
+        root = ET.fromstring(body)
+        hrefs = [element.text for element in root.findall(".//{DAV:}href")]
+        self.assertEqual(
+            hrefs,
+            ["/dav/public/", "/dav/public/moonshotai%40PerceptionBench%20%5Bdataset%5D/"],
+        )
 
     def test_public_root_lists_each_saved_resource_as_a_mount(self):
         status, body = self.request("PROPFIND", "/public/", headers={"Depth": "1"})

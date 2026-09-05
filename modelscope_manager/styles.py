@@ -3,7 +3,8 @@ QSS = r"""
 MainWindow, QMainWindow, QWidget#root,
 QWidget#resourceInterface, QWidget#transferInterface, QWidget#settingsInterface,
 QWidget#searchInterface, QWidget#backupInterface, QWidget#imageInterface { background: #f3f3f3; }
-QScrollArea#settingsScroll, QScrollArea#settingsScroll > QWidget > QWidget, QWidget#settingsContent { background: transparent; border: none; }
+QScrollArea#settingsScroll, QScrollArea#settingsScroll > QWidget > QWidget, QWidget#settingsContent,
+QScrollArea#statisticsScroll, QScrollArea#statisticsScroll > QWidget > QWidget, QWidget#statisticsContent { background: transparent; border: none; }
 QFrame#fluentSettingsPanel { background: transparent; border: none; }
 QStatusBar#fluentStatusBar { background: transparent; border-top: 1px solid #e2e2e2; }
 QFrame#sidebar { background: rgba(249,249,249,245); border-right: 1px solid #dedede; }
@@ -15,6 +16,11 @@ QPushButton#navButton { background: transparent; border: none; text-align: left;
 QPushButton#navButton:hover { background: #ededed; }
 QPushButton#navButton:checked { background: #e5f1fb; color: #005a9e; font-weight: 600; border-left: 3px solid #0067c0; padding-left: 10px; }
 QFrame#card { background: #ffffff; border: 1px solid #e5e5e5; border-radius: 10px; }
+QFrame#metricCard, QFrame#statsFilterCard, QFrame#statsChartCard { background: #ffffff; border: 1px solid #e1e5e9; border-radius: 12px; }
+QLabel#metricCaption { color: #666666; font-size: 12px; }
+QLabel#metricValue { color: #005a9e; background: #eaf4fb; border: 1px solid #c9e4f5; border-radius: 9px; padding: 7px 10px; font-size: 17px; font-weight: 650; }
+QLabel#speedPill { color: #005a9e; background: #edf6fc; border: 1px solid #c9e4f5; border-radius: 8px; padding: 5px 9px; font-weight: 600; }
+QLabel#transferTotalPill { color: #005a9e; background: #edf6fc; border: 1px solid #c9e4f5; border-radius: 9px; padding: 7px 14px; font-weight: 600; }
 QLabel#title { font-size: 24px; font-weight: 600; }
 QLabel#subtitle { color: #666666; }
 QLabel#section { font-size: 15px; font-weight: 600; }
@@ -25,8 +31,11 @@ QFrame#pathPill QLabel#breadcrumbSeparator { color: #777777; background: transpa
 QLabel#dropHint { color: #466b86; background: #edf6fc; border-radius: 5px; padding: 8px 11px; }
 QLabel#success { color: #0f7b0f; font-weight: 600; }
 QLabel#error { color: #c42b1c; font-weight: 600; }
-QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTimeEdit { background: #ffffff; border: 1px solid #c7c7c7; border-bottom: 2px solid #8a8a8a; border-radius: 5px; padding: 7px 9px; min-height: 20px; }
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QTimeEdit:focus { border-bottom-color: #0067c0; }
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTimeEdit, QDateTimeEdit { background: #ffffff; border: 1px solid #c7c7c7; border-bottom: 2px solid #8a8a8a; border-radius: 5px; padding: 7px 9px; min-height: 20px; }
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QTimeEdit:focus, QDateTimeEdit:focus { border-bottom-color: #0067c0; }
+QDateTimeEdit#statisticsDateEdit { border: 1px solid #b8c0c8; border-radius: 8px; padding: 6px 2px; font-size: 10px; }
+QDateTimeEdit#statisticsDateEdit:focus { border-color: #0067c0; }
+QDateTimeEdit#statisticsDateEdit::drop-down { width: 14px; background: transparent; border: none; border-left: 1px solid #d8dde2; border-top-right-radius: 7px; border-bottom-right-radius: 7px; }
 QPushButton { background: #ffffff; border: 1px solid #c7c7c7; border-radius: 5px; padding: 7px 14px; min-height: 20px; }
 QPushButton:hover { background: #f6f6f6; }
 QPushButton:pressed { background: #eeeeee; }
@@ -65,7 +74,8 @@ DARK_QSS = r"""
 MainWindow, QMainWindow, QWidget#root,
 QWidget#resourceInterface, QWidget#transferInterface, QWidget#settingsInterface,
 QWidget#searchInterface, QWidget#backupInterface, QWidget#imageInterface { background: #202124; }
-QScrollArea#settingsScroll, QScrollArea#settingsScroll > QWidget > QWidget, QWidget#settingsContent { background: transparent; border: none; }
+QScrollArea#settingsScroll, QScrollArea#settingsScroll > QWidget > QWidget, QWidget#settingsContent,
+QScrollArea#statisticsScroll, QScrollArea#statisticsScroll > QWidget > QWidget, QWidget#statisticsContent { background: transparent; border: none; }
 QFrame#fluentSettingsPanel { background: transparent; border: none; }
 QStatusBar#fluentStatusBar { background: transparent; border-top: 1px solid #41454d; }
 QFrame#sidebar, QFrame#navSidebar { background: #25272b; border-right: 1px solid #3b3e44; }
@@ -76,6 +86,11 @@ QPushButton#navButton { background: transparent; border: none; text-align: left;
 QPushButton#navButton:hover { background: #34373d; }
 QPushButton#navButton:checked { background: #173b58; color: #d9edff; font-weight: 600; border-left: 3px solid #4aa3df; padding-left: 10px; }
 QFrame#card { background: #2a2d32; border: 1px solid #41454d; border-radius: 10px; }
+QFrame#metricCard, QFrame#statsFilterCard, QFrame#statsChartCard { background: #2a2d32; border: 1px solid #414b55; border-radius: 12px; }
+QLabel#metricCaption { color: #b7bac0; font-size: 12px; }
+QLabel#metricValue { color: #d9edff; background: #173b58; border: 1px solid #285d82; border-radius: 9px; padding: 7px 10px; font-size: 17px; font-weight: 650; }
+QLabel#speedPill { color: #d9edff; background: #213d52; border: 1px solid #365d78; border-radius: 8px; padding: 5px 9px; font-weight: 600; }
+QLabel#transferTotalPill { color: #d9edff; background: #213d52; border: 1px solid #365d78; border-radius: 9px; padding: 7px 14px; font-weight: 600; }
 QLabel#title { font-size: 24px; font-weight: 600; }
 QLabel#section { font-size: 15px; font-weight: 600; }
 QLabel#pathPill, QFrame#pathPill { color: #d6d8dc; background: #30343a; border: 1px solid #4a4f58; border-radius: 5px; padding: 2px; }
@@ -85,8 +100,11 @@ QFrame#pathPill QLabel#breadcrumbSeparator { color: #aeb3bb; background: transpa
 QLabel#dropHint { color: #b7dbf4; background: #213647; border-radius: 5px; padding: 8px 11px; }
 QLabel#success { color: #74d680; font-weight: 600; }
 QLabel#error { color: #ff8e84; font-weight: 600; }
-QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTimeEdit { color: #f2f2f2; background: #202226; border: 1px solid #5a5f69; border-bottom: 2px solid #a5aab3; border-radius: 5px; padding: 7px 9px; min-height: 20px; }
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QTimeEdit:focus { border-bottom-color: #4aa3df; }
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTimeEdit, QDateTimeEdit { color: #f2f2f2; background: #202226; border: 1px solid #5a5f69; border-bottom: 2px solid #a5aab3; border-radius: 5px; padding: 7px 9px; min-height: 20px; }
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QTimeEdit:focus, QDateTimeEdit:focus { border-bottom-color: #4aa3df; }
+QDateTimeEdit#statisticsDateEdit { border: 1px solid #5a6470; border-radius: 8px; padding: 6px 2px; font-size: 10px; }
+QDateTimeEdit#statisticsDateEdit:focus { border-color: #4aa3df; }
+QDateTimeEdit#statisticsDateEdit::drop-down { width: 14px; background: transparent; border: none; border-left: 1px solid #48515b; border-top-right-radius: 7px; border-bottom-right-radius: 7px; }
 QComboBox QAbstractItemView { color: #f2f2f2; background: #2a2d32; selection-background-color: #174d73; }
 QPushButton { color: #ededed; background: #30333a; border: 1px solid #5a5f69; border-radius: 5px; padding: 7px 14px; min-height: 20px; }
 QPushButton:hover { background: #3a3e46; }

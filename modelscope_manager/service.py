@@ -20,11 +20,13 @@ if TYPE_CHECKING:
 
 SUPPORTED_REPO_TYPES = ("model", "dataset")
 REPOSITORY_PAGE_SIZE = 50
+DATASET_FILE_PAGE_SIZE = 3000
 MAX_MODEL_UPLOAD_FILE_SIZE = 50 * 1024**3
 
 
 _UPLOAD_LIMITER = SharedRateLimiter()
 _SDK_UPLOAD_LOCK = threading.RLock()
+_UPLOAD_PROGRESS = threading.local()
 
 
 def configure_upload_limit_supplier(supplier: Callable[[], int]) -> None:
@@ -180,6 +182,17 @@ class ModelScopeService:
         self.token = token
         self.user: Any | None = None
 
+    def reconnect(self) -> None:
+        """Discard pooled upload connections while retaining the account token."""
+        from modelscope_hub import HubApi
+
+        old_api = self.api
+        self.api = HubApi(token=self.token)
+        for client_name in ("legacy", "openapi"):
+            session = getattr(getattr(old_api, client_name, None), "_session", None)
+            if session is not None:
+                session.close()
+
     def verify(self) -> str:
         self.user = self.api.whoami()
         username = getattr(self.user, "username", None)
@@ -223,7 +236,7 @@ class ModelScopeService:
             # Use the SDK's paginator so large repositories are not truncated.
             files = self.api.legacy.list_dataset_files_paginated(
                 repo.repo_id,
-                page_size=100,
+                page_size=DATASET_FILE_PAGE_SIZE,
             )
         else:
             files = self.api.list_repo_files(repo.repo_id, repo.repo_type, recursive=True)
@@ -273,37 +286,64 @@ class ModelScopeService:
 
     @contextmanager
     def track_upload_progress(self, callback: Callable[[int], None]):
-        """Temporarily bridge the bundled SDK's byte counter to the GUI."""
+        """Bind the SDK byte counter to the current upload worker thread."""
         import modelscope_hub._upload as upload_module
 
         with _SDK_UPLOAD_LOCK:
-            original_tqdm = upload_module.tqdm
+            if not getattr(upload_module, "_modelscope_manager_progress", False):
+                original_tqdm = upload_module.tqdm
 
-            def progress_factory(iterable=None, **kwargs):
-                return _CallbackTqdm(iterable, callback=callback, **kwargs)
+                def progress_factory(iterable=None, **kwargs):
+                    active_callback = getattr(_UPLOAD_PROGRESS, "callback", None)
+                    if active_callback is not None and kwargs.get("unit") == "B":
+                        return _CallbackTqdm(iterable, callback=active_callback, **kwargs)
+                    return original_tqdm(iterable, **kwargs)
 
-            upload_module.tqdm = progress_factory
-            try:
-                yield
-            finally:
-                upload_module.tqdm = original_tqdm
+                upload_module.tqdm = progress_factory
+                upload_module._modelscope_manager_progress = True
+
+        previous = getattr(_UPLOAD_PROGRESS, "callback", None)
+        _UPLOAD_PROGRESS.callback = callback
+        try:
+            yield
+        finally:
+            if previous is None:
+                del _UPLOAD_PROGRESS.callback
+            else:
+                _UPLOAD_PROGRESS.callback = previous
 
     def upload_file(self, repo: Repository, local_path: Path, target_folder: str) -> Any:
         remote_path = normalize_remote_path(target_folder, local_path.name)
         return self.upload_file_as(repo, local_path, remote_path)
 
+    def _ensure_serial_file_commits(self) -> None:
+        """Keep blob transfers parallel while preventing same-branch commit races."""
+        with _SDK_UPLOAD_LOCK:
+            client = getattr(getattr(self.api, "uploader", None), "_client", None)
+            if client is None or getattr(self, "_serialized_commit_client", None) is client:
+                return
+            original_create_commit = client.create_commit
+            commit_lock = threading.Lock()
+
+            def serialized_create_commit(*args, **kwargs):
+                with commit_lock:
+                    return original_create_commit(*args, **kwargs)
+
+            client.create_commit = serialized_create_commit
+            self._serialized_commit_client = client
+
     def upload_file_as(self, repo: Repository, local_path: Path, remote_path: str) -> Any:
         local_path = validate_upload_source(local_path)
         remote_path = normalize_remote_path(remote_path)
-        with _SDK_UPLOAD_LOCK:
-            return self.api.upload_file(
-                repo.repo_id,
-                repo.repo_type,
-                str(local_path),
-                remote_path,
-                commit_message=f"Upload {local_path.name} via ModelScope Manager",
-                disable_tqdm=True,
-            )
+        self._ensure_serial_file_commits()
+        return self.api.upload_file(
+            repo.repo_id,
+            repo.repo_type,
+            str(local_path),
+            remote_path,
+            commit_message=f"Upload {local_path.name} via ModelScope Manager",
+            disable_tqdm=True,
+        )
 
     def upload_folder(
         self,
@@ -312,6 +352,7 @@ class ModelScopeService:
         target_folder: str,
         keep_folder_name: bool = True,
         ignore_patterns: list[str] | None = None,
+        max_workers: int | None = None,
     ) -> Any:
         local_path = validate_upload_source(local_path)
         remote_folder = normalize_remote_path(
@@ -326,6 +367,7 @@ class ModelScopeService:
                 path_in_repo=remote_folder,
                 commit_message=f"Upload folder {local_path.name} via ModelScope Manager",
                 ignore_patterns=ignore_patterns,
+                max_workers=max_workers,
                 disable_tqdm=True,
             )
 

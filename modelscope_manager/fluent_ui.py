@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, Qt, Signal
+from PySide6.QtCore import QPoint, Qt, Signal
 from PySide6.QtGui import QAction, QGuiApplication
 from PySide6.QtWidgets import QHBoxLayout, QSizePolicy, QVBoxLayout, QWidget
 from qfluentwidgets import (
@@ -21,9 +21,16 @@ class FluentSwitchButton(SwitchButton):
 
     def __init__(self, text: str = "", parent: QWidget | None = None):
         super().__init__(parent)
+        self._sourceText = text
+        self.setDisplayText(text)
+        self.checkedChanged.connect(self.toggled)
+
+    def sourceText(self) -> str:
+        return self._sourceText
+
+    def setDisplayText(self, text: str) -> None:
         self.setOnText(text)
         self.setOffText(text)
-        self.checkedChanged.connect(self.toggled)
 
 
 class ControlSettingCard(SettingCard):
@@ -58,6 +65,7 @@ class PanelSettingCard(SettingCard):
         parent: QWidget | None = None,
     ):
         super().__init__(icon, title, content, parent)
+        self._translator = lambda source: source
         self.panel = panel
         self.panel.setObjectName("fluentSettingsPanel")
         self.panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -88,60 +96,37 @@ class PanelSettingCard(SettingCard):
         self.hBoxLayout.setContentsMargins(0, 0, 0, 0)
         self.hBoxLayout.addLayout(body, 1)
         self._expanded = False
-        self.expandAnimation = QPropertyAnimation(self, b"minimumHeight", self)
-        self.expandAnimation.setDuration(180)
-        self.expandAnimation.valueChanged.connect(self._updateAnimationGeometry)
-        self.expandAnimation.finished.connect(self._animationFinished)
         self.setExpanded(False, animated=False)
 
     def isExpanded(self) -> bool:
         return self._expanded
 
+    def setTranslator(self, translator) -> None:
+        self._translator = translator
+        self.setExpanded(self._expanded, animated=False)
+
     def setExpanded(self, expanded: bool, animated: bool = False) -> None:
-        self.expandAnimation.stop()
         self._expanded = expanded
         self.expandButton.setIcon(
             FluentIcon.CARE_UP_SOLID if expanded else FluentIcon.CHEVRON_DOWN_MED
         )
-        self.expandButton.setToolTip("收起详细设置" if expanded else "展开详细设置")
+        self.expandButton.setToolTip(self._translator(
+            "收起详细设置" if expanded else "展开详细设置"
+        ))
         target = max(110, self.panel.sizeHint().height() + 96) if expanded else 70
-        if not animated:
-            self.panel.setVisible(expanded)
-            self.setMinimumHeight(target if expanded else 70)
-            self.setMaximumHeight(16777215 if expanded else 70)
-            self.updateGeometry()
-            return
-
-        current = max(70, self.height())
-        self.panel.setVisible(True)
-        self.setMinimumHeight(current)
-        self.setMaximumHeight(16777215)
-        self.expandAnimation.setStartValue(current)
-        self.expandAnimation.setEndValue(target)
-        self.expandAnimation.setEasingCurve(
-            QEasingCurve.Type.OutCubic if expanded else QEasingCurve.Type.InOutCubic
-        )
-        self.expandAnimation.start()
-        self.updateGeometry()
-
-    def toggleExpanded(self) -> None:
-        self.setExpanded(not self.isExpanded(), animated=True)
-
-    def _animationFinished(self) -> None:
-        if self._expanded:
-            self.setMinimumHeight(max(110, self.panel.sizeHint().height() + 96))
-            self.setMaximumHeight(16777215)
-        else:
-            self.panel.hide()
-            self.setMinimumHeight(70)
-            self.setMaximumHeight(70)
-        self.updateGeometry()
-
-    def _updateAnimationGeometry(self, _value) -> None:
+        self.panel.setVisible(expanded)
+        self.setMinimumHeight(target if expanded else 70)
+        self.setMaximumHeight(16777215 if expanded else 70)
         self.updateGeometry()
         parent = self.parentWidget()
         if parent:
-            parent.adjustSize()
+            parent.updateGeometry()
+        window = self.window()
+        window.update()
+        window.repaint()
+
+    def toggleExpanded(self) -> None:
+        self.setExpanded(not self.isExpanded(), animated=False)
 
 
 class CleanComboBox(ComboBox):
@@ -191,6 +176,6 @@ class CleanComboBox(ComboBox):
             position.setY(min(position.y(), available.bottom() - menu.height() + 1))
         else:
             position.setY(max(available.top() + menu.height(), position.y()))
-        menu.closedSignal.connect(lambda: self.window().update())
+        menu.closedSignal.connect(lambda: (self.window().update(), self.window().repaint()))
         menu.view.adjustSize(position, MenuAnimationType.NONE)
         menu.exec(position, ani=False, aniType=MenuAnimationType.NONE)

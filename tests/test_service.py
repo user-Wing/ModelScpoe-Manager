@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import requests
 
 from modelscope_manager.service import (
+    DATASET_FILE_PAGE_SIZE,
     ModelScopeService,
     ModelScopeWebService,
     RemoteEntry,
@@ -119,7 +120,7 @@ class RepositoryTests(unittest.TestCase):
 
         self.assertEqual(paths, ["a.txt", "b/file.txt"])
         service.api.legacy.list_dataset_files_paginated.assert_called_once_with(
-            "alice/data", page_size=100
+            "alice/data", page_size=DATASET_FILE_PAGE_SIZE
         )
 
     def test_dataset_file_listing_keeps_all_paginated_results(self):

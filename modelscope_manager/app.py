@@ -16,20 +16,20 @@ import time
 import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import quote
 from urllib.request import Request
 
 from PySide6.QtCore import (
-    QEvent, QProcess,
+    QDateTime, QEvent, QPointF, QProcess,
     QSettings, QSize, Qt, QThread, QTime, QTimer, QUrl, Signal,
 )
 from PySide6.QtGui import (
     QAction, QColor, QDesktopServices, QDragEnterEvent, QDropEvent, QFont,
-    QIcon, QImageReader, QKeySequence, QPalette,
+    QIcon, QImageReader, QKeySequence, QPainter, QPalette, QPen, QPolygonF,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QDateTimeEdit,
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
@@ -86,6 +87,7 @@ from qfluentwidgets import (
     setThemeColor,
 )
 
+from . import __version__
 from .security import protect, unprotect
 from .http_security import modelscope_token_headers, safe_urlopen
 from .download_service import Aria2DownloadRunner, Aria2Tuning, DownloadSpec, build_download_specs
@@ -140,6 +142,7 @@ from .storage import (
 )
 from .startup import set_windows_startup, windows_startup_enabled
 from .transfer_policy import SpeedRule, TransferPolicy
+from .transfer_statistics import TransferSample, TransferStatistics, UploadHealthMonitor
 from .webdav_server import ModelScopeWebDAV
 from .web_session import (
     DELETE_BATCH_SIZE, ModelScopeWebSession, delete_repository_file, delete_repository_files,
@@ -233,6 +236,74 @@ def format_size(value: int) -> str:
             return f"{amount:.0f} {unit}" if unit == "B" else f"{amount:.1f} {unit}"
         amount /= 1024
     return "--"
+
+
+class TransferChart(QWidget):
+    def __init__(self, direction: str, color: str, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.direction = direction
+        self.color = QColor(color)
+        self.samples: list[TransferSample] = []
+        self.start_time = 0.0
+        self.end_time = 1.0
+        self.setMinimumHeight(210)
+
+    def set_data(self, samples: list[TransferSample], start_time: float, end_time: float) -> None:
+        self.samples = samples
+        self.start_time = float(start_time)
+        self.end_time = max(self.start_time + 1, float(end_time))
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        text_color = self.palette().color(QPalette.ColorRole.Text)
+        muted_color = self.palette().color(QPalette.ColorRole.Mid)
+        left, top, right, bottom = 78, 28, 24, 42
+        width = max(1, self.width() - left - right)
+        height = max(1, self.height() - top - bottom)
+        speeds = [
+            sample.upload_speed if self.direction == "upload" else sample.download_speed
+            for sample in self.samples
+        ]
+        maximum = max(speeds, default=0.0)
+        unit_size, unit = self._speed_unit(maximum)
+        axis_max = max(unit_size, maximum)
+
+        painter.setPen(QPen(muted_color, 1))
+        for index in range(5):
+            y = top + height * index / 4
+            painter.drawLine(left, int(y), left + width, int(y))
+            label = f"{axis_max * (4 - index) / 4 / unit_size:.1f}"
+            painter.setPen(text_color)
+            painter.drawText(4, int(y - 9), left - 14, 18, Qt.AlignmentFlag.AlignRight, label)
+            painter.setPen(QPen(muted_color, 1))
+
+        start_label = datetime.fromtimestamp(self.start_time).strftime("%m-%d %H:%M")
+        end_label = datetime.fromtimestamp(self.end_time).strftime("%m-%d %H:%M")
+        painter.setPen(text_color)
+        painter.drawText(left, top + height + 10, width // 2, 20, Qt.AlignmentFlag.AlignLeft, start_label)
+        painter.drawText(left + width // 2, top + height + 10, width // 2, 20, Qt.AlignmentFlag.AlignRight, end_label)
+        painter.drawText(4, 4, left - 38, 18, Qt.AlignmentFlag.AlignRight, unit)
+
+        if speeds:
+            points = QPolygonF()
+            duration = self.end_time - self.start_time
+            for sample, speed in zip(self.samples, speeds):
+                x = left + width * (sample.timestamp - self.start_time) / duration
+                y = top + height * (1 - speed / axis_max)
+                points.append(QPointF(x, y))
+            painter.setPen(QPen(self.color, 2))
+            painter.drawPolyline(points)
+
+    @staticmethod
+    def _speed_unit(maximum: float) -> tuple[float, str]:
+        units = ((1024 ** 3, "GB/s"), (1024 ** 2, "MB/s"), (1024, "KB/s"))
+        for size, name in units:
+            if maximum >= size:
+                return float(size), name
+        return 1.0, "B/s"
 
 
 def local_paths_size(raw_paths: Iterable[str | Path]) -> int:
@@ -633,6 +704,7 @@ class UploadQueueItem:
     path: Path
     target: str
     status: str = "waiting"
+    completed_files: set[Path] = field(default_factory=set, repr=False)
 
 
 class UploadCancelled(Exception):
@@ -642,6 +714,8 @@ class UploadCancelled(Exception):
 class UploadThread(QThread):
     item_done = Signal(str, bool, str)
     progress_info = Signal(str, int, float, int)
+    bytes_transferred = Signal(int)
+    reconnect_ready = Signal(str)
     cancelled = Signal(str)
 
     def __init__(
@@ -650,6 +724,7 @@ class UploadThread(QThread):
         repo: Repository,
         item: UploadQueueItem,
         keep_name: bool,
+        max_workers: int,
         skipped_files: set[Path] | None = None,
         parent: QWidget | None = None,
     ):
@@ -658,10 +733,13 @@ class UploadThread(QThread):
         self.repo = repo
         self.item = item
         self.keep_name = keep_name
+        self.max_workers = max(1, int(max_workers))
         self.skipped_files = {path.resolve() for path in (skipped_files or set())}
         self._resume = threading.Event()
         self._resume.set()
         self._cancel = threading.Event()
+        self._reconnect = threading.Event()
+        self.stopped_for_reconnect = False
 
     def pause(self) -> None:
         self._resume.clear()
@@ -673,6 +751,9 @@ class UploadThread(QThread):
         self._cancel.set()
         self._resume.set()
 
+    def request_reconnect(self) -> None:
+        self._reconnect.set()
+
     def _wait_until_resumed(self) -> None:
         while not self._resume.wait(0.1):
             if self._cancel.is_set():
@@ -683,92 +764,161 @@ class UploadThread(QThread):
     def run(self) -> None:
         path = self.item.path
         try:
-            item_size = self._path_size(path, self.skipped_files)
+            root = path.resolve(strict=True)
+            if root.is_dir():
+                files = sorted(
+                    (
+                        child for child in iter_contained_files(root)
+                        if child.resolve() not in self.skipped_files
+                    ),
+                    key=lambda child: child.relative_to(root).as_posix().casefold(),
+                )
+                remote_root = normalize_remote_path(
+                    self.item.target,
+                    root.name if self.keep_name else "",
+                )
+                remote_paths = {
+                    child: normalize_remote_path(remote_root, child.relative_to(root).as_posix())
+                    for child in files
+                }
+            elif root.is_file():
+                files = [] if root in self.skipped_files else [root]
+                remote_paths = {
+                    root: normalize_remote_path(self.item.target, root.name),
+                }
+            else:
+                raise FileNotFoundError(str(path))
+            file_sizes = {child: max(0, child.stat().st_size) for child in files}
         except Exception as exc:
             self.item_done.emit(str(path), False, str(exc))
             return
+        item_size = max(1, sum(file_sizes.values()))
+        completed = {child.resolve() for child in self.item.completed_files}
+        self.item.completed_files.intersection_update(file_sizes)
         started = time.monotonic()
         last_speed_time = started
         last_speed_bytes = 0
         current_speed = 0.0
-        current_size = 0
+        transferred_size = 0
+        file_progress = {
+            child: file_sizes[child] if child.resolve() in completed else 0
+            for child in files
+        }
+        current_size = sum(file_progress.values())
         progress_lock = threading.Lock()
-        success_message = "上传完成"
+        failures: list[tuple[Path, Exception]] = []
 
-        def report_bytes(amount: int) -> None:
-            nonlocal current_size, last_speed_time, last_speed_bytes, current_speed
+        def emit_progress(progress: int, speed: float) -> None:
+            eta = int((item_size - progress) / speed) if speed > 0 else -1
+            self.progress_info.emit(
+                str(path), min(99, int(progress * 100 / item_size)), speed, eta,
+            )
+
+        def report_bytes(child: Path, amount: int) -> None:
+            nonlocal current_size, transferred_size, last_speed_time, last_speed_bytes, current_speed
             self._wait_until_resumed()
+            amount = max(0, amount)
             with progress_lock:
-                current_size = min(item_size, current_size + max(0, amount))
-            now = time.monotonic()
-            interval = now - last_speed_time
-            if interval >= 0.15:
-                instant = max(0, current_size - last_speed_bytes) / interval
-                current_speed = instant if current_speed <= 0 else current_speed * 0.55 + instant * 0.45
-                last_speed_time = now
-                last_speed_bytes = current_size
-            eta = int((item_size - current_size) / current_speed) if current_speed > 0 else -1
-            self.progress_info.emit(str(path), min(99, int(current_size * 100 / item_size)), current_speed, eta)
+                transferred_size += amount
+                credited = min(amount, max(0, file_sizes[child] - file_progress[child]))
+                file_progress[child] += credited
+                current_size += credited
+                now = time.monotonic()
+                interval = now - last_speed_time
+                if interval >= 0.15:
+                    instant = max(0, transferred_size - last_speed_bytes) / interval
+                    current_speed = instant if current_speed <= 0 else current_speed * 0.55 + instant * 0.45
+                    last_speed_time = now
+                    last_speed_bytes = transferred_size
+                progress = current_size
+                speed = current_speed
+            if amount:
+                self.bytes_transferred.emit(amount)
+            emit_progress(progress, speed)
+
+        def mark_file_complete(child: Path) -> None:
+            nonlocal current_size
+            with progress_lock:
+                current_size += file_sizes[child] - file_progress[child]
+                file_progress[child] = file_sizes[child]
+                self.item.completed_files.add(child.resolve())
+                progress = current_size
+                speed = current_speed
+            emit_progress(progress, speed)
+
+        def upload_one(child: Path) -> None:
+            self._wait_until_resumed()
+            with self.service.track_upload_progress(lambda amount: report_bytes(child, amount)):
+                self.service.upload_file_as(self.repo, child, remote_paths[child])
+            mark_file_complete(child)
+
+        if current_size:
+            emit_progress(current_size, 0.0)
 
         try:
-            self._wait_until_resumed()
-            with self.service.track_upload_progress(report_bytes):
-                if path.is_dir():
-                    skipped_inside = [item for item in self.skipped_files if item.is_relative_to(path)]
-                    if skipped_inside:
-                        safe_files = [
-                            item for item in path.rglob("*")
-                            if item.is_file() and item.resolve() not in self.skipped_files
-                        ]
-                        if not safe_files:
-                            success_message = "所有文件均超过 50 GB，已跳过"
-                        else:
-                            remote_base = normalize_remote_path(
-                                self.item.target,
-                                path.name if self.keep_name else "",
-                            )
-                            errors: list[str] = []
-                            for safe_file in safe_files:
-                                self._wait_until_resumed()
-                                relative_parent = safe_file.relative_to(path).parent.as_posix()
-                                try:
-                                    self.service.upload_file(
-                                        self.repo,
-                                        safe_file,
-                                        normalize_remote_path(remote_base, relative_parent),
-                                    )
-                                except UploadCancelled:
-                                    raise
-                                except Exception as exc:
-                                    errors.append(f"{safe_file}: {exc}")
-                            if errors:
-                                raise RuntimeError("；".join(errors))
-                    else:
-                        self.service.upload_folder(self.repo, path, self.item.target, self.keep_name)
-                elif path.is_file():
-                    self.service.upload_file(self.repo, path, self.item.target)
-                else:
-                    raise FileNotFoundError(str(path))
+            pending_files = [
+                child for child in files
+                if child.resolve() not in self.item.completed_files
+            ]
+            file_iterator = iter(pending_files)
+            futures = {}
+            with ThreadPoolExecutor(max_workers=min(self.max_workers, max(1, len(pending_files)))) as executor:
+                def submit_next() -> None:
+                    if self._cancel.is_set() or self._reconnect.is_set():
+                        return
+                    try:
+                        child = next(file_iterator)
+                    except StopIteration:
+                        return
+                    futures[executor.submit(upload_one, child)] = child
+
+                for _ in range(min(self.max_workers, len(pending_files))):
+                    submit_next()
+                while futures:
+                    future = next(as_completed(tuple(futures)))
+                    child = futures.pop(future)
+                    try:
+                        future.result()
+                    except UploadCancelled:
+                        self._cancel.set()
+                    except Exception as exc:
+                        failures.append((child, exc))
+                    submit_next()
         except UploadCancelled:
-            self.cancelled.emit(str(path))
+            self._cancel.set()
         except Exception as exc:
             self.item_done.emit(str(path), False, str(exc))
-        else:
-            self.progress_info.emit(str(path), 100, current_speed, 0)
-            self.item_done.emit(str(path), True, success_message)
+            return
 
-    @staticmethod
-    def _path_size(path: Path, skipped_files: set[Path] | None = None) -> int:
-        skipped_files = skipped_files or set()
-        total = 0
-        for child in iter_contained_files(path):
-            if child.resolve() in skipped_files:
-                continue
-            try:
-                total += child.stat().st_size
-            except OSError:
-                total += 1
-        return max(1, total)
+        if self._cancel.is_set():
+            self.cancelled.emit(str(path))
+            return
+
+        remaining = [
+            child for child in files
+            if child.resolve() not in self.item.completed_files
+        ]
+        if self._reconnect.is_set() and remaining:
+            self.stopped_for_reconnect = True
+            self.reconnect_ready.emit(str(path))
+            return
+
+        if failures:
+            first_path, first_error = failures[0]
+            self.item_done.emit(
+                str(path),
+                False,
+                f"{len(self.item.completed_files)}/{len(files)} 个文件已分别提交；"
+                f"{len(failures)} 个失败，首个错误：{first_path.name} · {first_error}",
+            )
+            return
+
+        self.progress_info.emit(str(path), 100, current_speed, 0)
+        if not files and self.skipped_files:
+            message = "所有文件均超过 50 GB，已跳过"
+        else:
+            message = f"上传完成：{len(files)} 个文件已分别提交"
+        self.item_done.emit(str(path), True, message)
 
 
 class DownloadThread(QThread):
@@ -1126,9 +1276,13 @@ class ModelScopeLoginDialog(QDialog):
     session_captured = Signal(object, object)
     session_url = "https://www.modelscope.cn/datasets/ARXChem/Animations-List/tree/master/Violet%20Evergarden"
 
-    def __init__(self, account_label: str, parent: QWidget | None = None):
+    def __init__(
+        self, account_label: str, translator: Callable[[str], str] | None = None,
+        parent: QWidget | None = None,
+    ):
         super().__init__(parent)
-        self.setWindowTitle(f"ModelScope 在线登录 · {account_label}")
+        self._translate = translator or (lambda source: source)
+        self.setWindowTitle(self._tf("ModelScope 在线登录 · {account}", account=account_label))
         self.resize(1080, 760)
         self.setMinimumSize(820, 600)
         self._cookies: dict[str, str] = {}
@@ -1140,12 +1294,12 @@ class ModelScopeLoginDialog(QDialog):
         self.address = QLineEdit()
         self.address.setReadOnly(True)
         toolbar.addWidget(self.address, 1)
-        reload_button = QPushButton("刷新")
+        reload_button = QPushButton(self._t("刷新"))
         reload_button.clicked.connect(lambda: self.web_view.reload())
         toolbar.addWidget(reload_button)
         layout.addLayout(toolbar)
 
-        self.status_label = QLabel("请在下方 ModelScope 官方页面完成短信或账密登录。", objectName="subtitle")
+        self.status_label = QLabel(self._t("请在下方 ModelScope 官方页面完成短信或账密登录。"), objectName="subtitle")
         layout.addWidget(self.status_label)
 
         self.profile = QWebEngineProfile(self)
@@ -1162,14 +1316,20 @@ class ModelScopeLoginDialog(QDialog):
 
         actions = QHBoxLayout()
         actions.addStretch()
-        cancel_button = QPushButton("取消")
+        cancel_button = QPushButton(self._t("取消"))
         cancel_button.clicked.connect(self.reject)
         actions.addWidget(cancel_button)
-        self.save_button = QPushButton("保存登录信息", objectName="primary")
+        self.save_button = QPushButton(self._t("保存登录信息"), objectName="primary")
         self.save_button.clicked.connect(self._save_session)
         actions.addWidget(self.save_button)
         layout.addLayout(actions)
         self.web_view.setUrl(QUrl("https://www.modelscope.cn/login"))
+
+    def _t(self, source: str) -> str:
+        return self._translate(source)
+
+    def _tf(self, source: str, **values) -> str:
+        return self._t(source).format(**values)
 
     @staticmethod
     def _cookie_text(value) -> str:
@@ -1201,9 +1361,9 @@ class ModelScopeLoginDialog(QDialog):
     def _update_capture_status(self) -> None:
         missing = [name for name in ("m_session_id", "csrf_session", "csrf_token") if not self._cookies.get(name)]
         if not missing:
-            self.status_label.setText("已检测到登录会话。请确认页面已登录成功，然后保存登录信息。")
+            self.status_label.setText(self._t("已检测到登录会话。请确认页面已登录成功，然后保存登录信息。"))
         elif self._preparing_session:
-            self.status_label.setText("正在从仓库页面取得删除凭据，尚缺少：" + "、".join(missing))
+            self.status_label.setText(self._tf("正在从仓库页面取得删除凭据，尚缺少：{missing}", missing=", ".join(missing)))
 
     def _page_loaded(self, ok: bool) -> None:
         if not ok or not self._preparing_session:
@@ -1215,11 +1375,11 @@ class ModelScopeLoginDialog(QDialog):
         self._preparing_session = False
         missing = [name for name in ("m_session_id", "csrf_session", "csrf_token") if not self._cookies.get(name)]
         if missing:
-            self.status_label.setText("登录信息仍不完整，缺少：" + "、".join(missing))
+            self.status_label.setText(self._tf("登录信息仍不完整，缺少：{missing}", missing=", ".join(missing)))
             QMessageBox.warning(
                 self,
-                "登录信息不完整",
-                "未能取得删除所需的网页登录信息：" + "、".join(missing) + "。请确认页面显示已登录后重试。",
+                self._t("登录信息不完整"),
+                self._tf("未能取得删除所需的网页登录信息：{missing}。请确认页面显示已登录后重试。", missing=", ".join(missing)),
             )
             return
         self._validate_and_save_session()
@@ -1229,10 +1389,10 @@ class ModelScopeLoginDialog(QDialog):
         missing = [name for name in ("m_session_id", "csrf_session", "csrf_token") if not self._cookies.get(name)]
         if missing:
             if not self._cookies.get("m_session_id"):
-                QMessageBox.information(self, "尚未登录", "尚未检测到 ModelScope 登录会话，请先完成登录。")
+                QMessageBox.information(self, self._t("尚未登录"), self._t("尚未检测到 ModelScope 登录会话，请先完成登录。"))
                 return
             self._preparing_session = True
-            self.status_label.setText("正在进入仓库页面取得删除凭据…")
+            self.status_label.setText(self._t("正在进入仓库页面取得删除凭据…"))
             self.web_view.setUrl(QUrl(self.session_url))
             return
         self._validate_and_save_session()
@@ -1244,12 +1404,12 @@ class ModelScopeLoginDialog(QDialog):
                 self._cookies.get("csrf_session", ""),
                 self._cookies.get("csrf_token", ""),
             )
-            self.status_label.setText("正在验证网页登录状态…")
+            self.status_label.setText(self._t("正在验证网页登录状态…"))
             QApplication.processEvents()
             user_info = fetch_web_user_info(session)
         except Exception as exc:
-            self.status_label.setText("尚未取得有效登录状态，请完成登录后重试。")
-            QMessageBox.warning(self, "在线登录验证失败", str(exc))
+            self.status_label.setText(self._t("尚未取得有效登录状态，请完成登录后重试。"))
+            QMessageBox.warning(self, self._t("在线登录验证失败"), str(exc))
             return
         self.session_captured.emit(session, user_info)
         self.accept()
@@ -1263,7 +1423,7 @@ class MainWindow(FluentWindow):
     def __init__(self):
         self._event_filter_ready = False
         super().__init__()
-        self.setWindowTitle("ModelScope Manager")
+        self.setWindowTitle(f"ModelScope Manager {__version__}")
         self.resize(1180, 760)
         self.setMinimumSize(980, 650)
         self.settings = portable_settings()
@@ -1352,6 +1512,10 @@ class MainWindow(FluentWindow):
         self.dirty_repositories: set[tuple[str, str, str, bool]] = set()
         self.current_upload_speed = 0.0
         self.current_download_speed = 0.0
+        self.session_started_at = time.time()
+        self.transfer_statistics = TransferStatistics(self.session_started_at)
+        self.upload_health_monitor = UploadHealthMonitor()
+        self._download_stat_last_completed = 0
         self._force_close = False
         self._restoring_settings = False
         self.task: QThread | None = None
@@ -1371,6 +1535,9 @@ class MainWindow(FluentWindow):
         self.transfer_policy_timer = QTimer(self)
         self.transfer_policy_timer.setInterval(30000)
         self.transfer_policy_timer.timeout.connect(self._refresh_transfer_limit_status)
+        self.transfer_statistics_timer = QTimer(self)
+        self.transfer_statistics_timer.setInterval(1000)
+        self.transfer_statistics_timer.timeout.connect(self._sample_transfer_statistics)
         self._build_ui()
         hints = QApplication.instance().styleHints()
         if hasattr(hints, "colorSchemeChanged"):
@@ -1392,6 +1559,7 @@ class MainWindow(FluentWindow):
             QTimer.singleShot(0, lambda: self._start_folder_indexing(True))
         self.backup_timer.start()
         self.transfer_policy_timer.start()
+        self.transfer_statistics_timer.start()
         self._event_filter_ready = True
 
     def _build_ui(self) -> None:
@@ -1401,7 +1569,7 @@ class MainWindow(FluentWindow):
         self.navigationInterface.setAcrylicEnabled(True)
         self.status_bar = QStatusBar(self)
         self.status_bar.setObjectName("fluentStatusBar")
-        self.status_bar.showMessage("ModelScope Manager 1.0.4")
+        self.status_bar.showMessage(f"ModelScope Manager {__version__}")
         self.widgetLayout.removeWidget(self.stackedWidget)
         content_layout = QVBoxLayout()
         content_layout.setContentsMargins(0, 0, 0, 0)
@@ -1719,6 +1887,116 @@ class MainWindow(FluentWindow):
         self.download_stats = QLabel("速度：-- · 剩余：--", objectName="subtitle")
         download_layout.addWidget(self.download_stats)
         self.queue_tabs.addTab(download_page, "下载")
+
+        statistics_page = QWidget()
+        statistics_page_layout = QVBoxLayout(statistics_page)
+        statistics_page_layout.setContentsMargins(0, 0, 0, 0)
+        statistics_scroll = FluentScrollArea()
+        statistics_scroll.setObjectName("statisticsScroll")
+        statistics_scroll.setWidgetResizable(True)
+        statistics_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        statistics_content = QWidget()
+        statistics_content.setObjectName("statisticsContent")
+        statistics_layout = QVBoxLayout(statistics_content)
+        statistics_layout.setContentsMargins(10, 14, 10, 16)
+        statistics_layout.setSpacing(14)
+
+        filter_card = QFrame(objectName="statsFilterCard")
+        filter_layout = QGridLayout(filter_card)
+        filter_layout.setContentsMargins(16, 14, 16, 14)
+        filter_layout.setHorizontalSpacing(12)
+        filter_layout.setVerticalSpacing(10)
+        filter_layout.addWidget(QLabel("时间段", objectName="section"), 0, 0, 1, 4)
+        filter_layout.addWidget(QLabel("开始时间", objectName="metricCaption"), 1, 0)
+        self.statistics_start_edit = QDateTimeEdit()
+        self.statistics_start_edit.setObjectName("statisticsDateEdit")
+        self.statistics_start_edit.setCalendarPopup(True)
+        self.statistics_start_edit.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+        self.statistics_start_edit.setFixedWidth(136)
+        self.statistics_end_edit = QDateTimeEdit()
+        self.statistics_end_edit.setObjectName("statisticsDateEdit")
+        self.statistics_end_edit.setCalendarPopup(True)
+        self.statistics_end_edit.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+        self.statistics_end_edit.setFixedWidth(136)
+        now = datetime.now()
+        session_start = datetime.fromtimestamp(self.session_started_at)
+        self.statistics_start_edit.setDateTime(QDateTime(max(session_start, now - timedelta(days=1))))
+        self.statistics_end_edit.setDateTime(QDateTime(now))
+        filter_layout.addWidget(self.statistics_start_edit, 2, 0)
+        filter_layout.addWidget(QLabel("结束时间", objectName="metricCaption"), 1, 1)
+        filter_layout.addWidget(self.statistics_end_edit, 2, 1)
+        self.statistics_live_checkbox = QCheckBox("实时")
+        self.statistics_live_checkbox.setChecked(True)
+        self.statistics_live_checkbox.toggled.connect(self._refresh_transfer_statistics)
+        filter_layout.addWidget(self.statistics_live_checkbox, 2, 2)
+        refresh_statistics_button = QPushButton("刷新")
+        refresh_statistics_button.clicked.connect(self._refresh_transfer_statistics)
+        filter_layout.addWidget(refresh_statistics_button, 2, 3)
+        filter_layout.setColumnStretch(0, 1)
+        filter_layout.setColumnStretch(1, 1)
+        statistics_layout.addWidget(filter_card)
+
+        metrics_row = QHBoxLayout()
+        metrics_row.setSpacing(12)
+
+        def add_metric(caption: str) -> QLabel:
+            card = QFrame(objectName="metricCard")
+            layout = QVBoxLayout(card)
+            layout.setContentsMargins(14, 12, 14, 12)
+            layout.setSpacing(7)
+            label = QLabel(caption, objectName="metricCaption")
+            value = QLabel("0 B/s", objectName="metricValue")
+            value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            value.setMinimumWidth(130)
+            layout.addWidget(label)
+            layout.addWidget(value)
+            metrics_row.addWidget(card, 1)
+            return value
+
+        self.statistics_upload_value = add_metric("当前上传速度")
+        self.statistics_download_value = add_metric("当前下载速度")
+        self.statistics_learned_value = add_metric("已学习上传速度")
+        statistics_layout.addLayout(metrics_row)
+
+        upload_chart_card = QFrame(objectName="statsChartCard")
+        upload_chart_layout = QVBoxLayout(upload_chart_card)
+        upload_chart_layout.setContentsMargins(16, 14, 16, 12)
+        upload_chart_layout.setSpacing(10)
+        upload_chart_header = QHBoxLayout()
+        upload_chart_header.addWidget(QLabel("上传速度", objectName="section"))
+        upload_chart_header.addStretch()
+        self.upload_chart_metrics = QLabel("平均 0 B/s  ·  峰值 0 B/s", objectName="speedPill")
+        upload_chart_header.addWidget(self.upload_chart_metrics)
+        upload_chart_layout.addLayout(upload_chart_header)
+        self.upload_chart = TransferChart("upload", "#1677ff")
+        upload_chart_layout.addWidget(self.upload_chart)
+        statistics_layout.addWidget(upload_chart_card)
+
+        download_chart_card = QFrame(objectName="statsChartCard")
+        download_chart_layout = QVBoxLayout(download_chart_card)
+        download_chart_layout.setContentsMargins(16, 14, 16, 12)
+        download_chart_layout.setSpacing(10)
+        download_chart_header = QHBoxLayout()
+        download_chart_header.addWidget(QLabel("下载速度", objectName="section"))
+        download_chart_header.addStretch()
+        self.download_chart_metrics = QLabel("平均 0 B/s  ·  峰值 0 B/s", objectName="speedPill")
+        download_chart_header.addWidget(self.download_chart_metrics)
+        download_chart_layout.addLayout(download_chart_header)
+        self.download_chart = TransferChart("download", "#16a34a")
+        download_chart_layout.addWidget(self.download_chart)
+        statistics_layout.addWidget(download_chart_card)
+
+        self.statistics_summary = QLabel(objectName="transferTotalPill")
+        self.statistics_summary.setMinimumWidth(520)
+        self.statistics_summary.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.statistics_summary.setWordWrap(False)
+        statistics_layout.addWidget(self.statistics_summary)
+        self.statistics_note = QLabel("仅统计本次软件启动以来的数据；速度每秒采样。", objectName="subtitle")
+        self.statistics_note.setWordWrap(True)
+        statistics_layout.addWidget(self.statistics_note)
+        statistics_scroll.setWidget(statistics_content)
+        statistics_page_layout.addWidget(statistics_scroll)
+        self.queue_tabs.addTab(statistics_page, "统计分析")
         transfer_layout.addWidget(self.queue_tabs, 1)
         self.log = QTextEdit()
         self.log.setReadOnly(True)
@@ -1864,6 +2142,15 @@ class MainWindow(FluentWindow):
         self.drop_upload_threshold_mb.valueChanged.connect(self._drop_upload_threshold_changed)
         drop_threshold_row.addWidget(self._stepper(self.drop_upload_threshold_mb), 1)
         download_setting_layout.addLayout(drop_threshold_row)
+        upload_queue_row = QHBoxLayout()
+        upload_queue_row.addWidget(QLabel("上传队列数", objectName="subtitle"))
+        self.upload_queue_count = QSpinBox()
+        self.upload_queue_count.setRange(1, 16)
+        self.upload_queue_count.setValue(4)
+        self.upload_queue_count.setToolTip("ModelScope Python SDK 同时上传的文件任务数")
+        self.upload_queue_count.valueChanged.connect(self._upload_queue_count_changed)
+        upload_queue_row.addWidget(self._stepper(self.upload_queue_count), 1)
+        download_setting_layout.addLayout(upload_queue_row)
 
         player_card = QFrame(objectName="card")
         player_layout = QVBoxLayout(player_card)
@@ -2174,7 +2461,7 @@ class MainWindow(FluentWindow):
         self.alist_url_label = QLabel("WebDAV 地址：--", objectName="pathPill")
         self.alist_url_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         alist_layout.addWidget(self.alist_url_label)
-        alist_help = QLabel("AList 后台添加存储：驱动选择 WebDAV，厂商选择“其他”，地址填写上方 URL，根文件夹路径填写 / 或留空。若 AList 在 Docker 中，可使用 host.docker.internal。其他设备连接时必须选择“局域网 / Docker”监听；若仍然连接超时，请在 Windows Defender 防火墙中允许本程序。", objectName="subtitle")
+        alist_help = QLabel("AList 后台添加存储：驱动选择 WebDAV，厂商选择“其他”，地址填写上方 URL；挂载全部内容时根文件夹路径填写 / 或留空，只挂载子目录时可填写 /models、/datasets 或 /public。若 AList 在 Docker 中，可使用 host.docker.internal。其他设备连接时必须选择“局域网 / Docker”监听；若仍然连接超时，请在 Windows Defender 防火墙中允许本程序。", objectName="subtitle")
         alist_help.setWordWrap(True)
         alist_layout.addWidget(alist_help)
         alist_actions = QHBoxLayout()
@@ -2226,7 +2513,7 @@ class MainWindow(FluentWindow):
 
         panel_specs = (
             ("账号设置", FIF.PEOPLE, "ModelScope 账户", "Token 与网页登录信息使用设备绑定加密保存", token_card),
-            ("下载设置", FIF.DOWNLOAD, "下载与传输", "默认目录、aria2-next 分段和共享限速", download_card),
+            ("下载设置", FIF.DOWNLOAD, "下载与传输", "默认目录、aria2-next 分段、SDK 上传队列和共享限速", download_card),
             ("播放设置", FIF.PLAY, "媒体播放器", "内置 PotPlayer 与第三方播放器", player_card),
             ("索引和预览", FIF.SEARCH, "索引与预览", "后台索引、缩略图和复制阈值", index_card),
         )
@@ -2523,6 +2810,7 @@ class MainWindow(FluentWindow):
             4: backup_page,
             5: image_page,
         }
+        self._refresh_transfer_statistics()
         self._navigate(0)
 
     def _restore_settings(self) -> None:
@@ -2531,6 +2819,7 @@ class MainWindow(FluentWindow):
         default_download = Path.home() / "Downloads"
         self.download_path_edit.setText(str(self.settings.value("download_path", str(default_download))))
         self.drop_upload_threshold_mb.setValue(int(self.settings.value("upload/drop_threshold_mb", 1024)))
+        self.upload_queue_count.setValue(int(self.settings.value("upload/queue_count", 4)))
         self.image_dest_edit.setText(str(self.settings.value("image/destination", "images")))
         self.aria_small_limit.setValue(float(self.settings.value("aria2/small_limit_mb", 1.0)))
         self.aria_small_segments.setValue(int(self.settings.value("aria2/small_segments", 1)))
@@ -2838,11 +3127,11 @@ class MainWindow(FluentWindow):
             username_item = QTableWidgetItem(account.username or "--")
             username_item.setFlags(username_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             table.setItem(row, 1, username_item)
-            status = "成功" if (self.session_web_sessions.get(account.account_id) or self.account_store.load_web_session(account.account_id)) else "尚未登录"
+            status = self._t("成功") if (self.session_web_sessions.get(account.account_id) or self.account_store.load_web_session(account.account_id)) else self._t("尚未登录")
             status_item = QTableWidgetItem(status)
             status_item.setFlags(status_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             table.setItem(row, 2, status_item)
-            login_button = QPushButton("在线登录", objectName="primary")
+            login_button = QPushButton(self._t("在线登录"), objectName="primary")
             login_button.clicked.connect(
                 lambda checked=False, account_id=account.account_id: self.open_online_login(account_id)
             )
@@ -2865,7 +3154,7 @@ class MainWindow(FluentWindow):
     def add_web_account(self) -> None:
         index = len(self.web_accounts) + 1
         account = self.account_store.save_web_account(
-            WebAccountRecord("", f"网页登录账户 {index}", "", "login_required")
+            WebAccountRecord("", self._tf("网页登录账户 {index}", index=index), "", "login_required")
         )
         self.web_accounts.append(account)
         self._render_web_accounts()
@@ -2878,8 +3167,8 @@ class MainWindow(FluentWindow):
         if not account:
             return
         answer = QMessageBox.question(
-            self, "移除网页登录账户",
-            f"确定移除网页登录账户 {account.label}？本地保存的 Cookie 将被销毁。",
+            self, self._t("移除网页登录账户"),
+            self._tf("确定移除网页登录账户 {name}？本地保存的 Cookie 将被销毁。", name=account.label),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -2900,7 +3189,7 @@ class MainWindow(FluentWindow):
         if not account:
             QMessageBox.information(self, self._t("请选择账户"), self._t("请先添加一个网页登录账户。"))
             return
-        dialog = ModelScopeLoginDialog(account.label or account.username, self)
+        dialog = ModelScopeLoginDialog(account.label or account.username, self._t, self)
         dialog.session_captured.connect(
             lambda session, info, current_id=account.account_id: self._online_login_completed(current_id, session, info)
         )
@@ -3571,7 +3860,7 @@ class MainWindow(FluentWindow):
 
     def _set_view_mode(self, mode: str) -> None:
         self.resource_view_mode = mode
-        self.view_button.setText("查看：缩略图 ▾" if mode == "thumbnails" else "查看：详细信息 ▾")
+        self.view_button.setText(self._t("查看：缩略图 ▾" if mode == "thumbnails" else "查看：详细信息 ▾"))
         self.remote_detail_tree.setVisible(mode == "details")
         self.remote_thumbnail_list.setVisible(mode == "thumbnails")
         self._render_remote_details()
@@ -3787,6 +4076,21 @@ class MainWindow(FluentWindow):
                 widget.setProperty("i18nSourceTooltip", tooltip_source)
             if tooltip_source:
                 widget.setToolTip(self._t(str(tooltip_source)))
+        for switch in self.findChildren(FluentSwitchButton):
+            source = switch.property("i18nSourceText")
+            if source is None:
+                source = switch.sourceText()
+                switch.setProperty("i18nSourceText", source)
+            switch.setDisplayText(self._t(str(source)))
+        for widget in self.findChildren(QWidget):
+            tooltip_source = widget.property("i18nSourceTooltip")
+            if tooltip_source is None and widget.toolTip():
+                tooltip_source = widget.toolTip()
+                widget.setProperty("i18nSourceTooltip", tooltip_source)
+            if tooltip_source:
+                widget.setToolTip(self._t(str(tooltip_source)))
+        for card in self.findChildren(PanelSettingCard):
+            card.setTranslator(self._t)
         for edit in self.findChildren(QLineEdit):
             source = edit.property("i18nPlaceholder")
             if source is None and edit.placeholderText():
@@ -3836,6 +4140,26 @@ class MainWindow(FluentWindow):
         self.background_index_minutes.setSuffix(" min" if english else " 分钟")
         self.drop_upload_threshold_mb.setSuffix(" MB")
         self.resource_path_label.set_path(self.current_directory_path, self._t("根目录"))
+        for route_key, source in (
+            ("resourceInterface", "资源管理"),
+            ("searchInterface", "资源搜索"),
+            ("transferInterface", "传输列表"),
+            ("backupInterface", "备份文件夹"),
+            ("imageInterface", "图床"),
+            ("settingsInterface", "设置"),
+        ):
+            item = self.navigationInterface.widget(route_key)
+            if item is not None and hasattr(item, "setText"):
+                item.setText(self._t(source))
+        self._refresh_transfer_statistics()
+        if hasattr(self, "queue_table"):
+            self._render_upload_queue()
+        if hasattr(self, "web_account_table"):
+            self._render_web_accounts()
+        if hasattr(self, "backup_table"):
+            self._render_backup_jobs()
+        if hasattr(self, "repo_list"):
+            self._render_repositories()
         self._update_alist_url()
         if hasattr(self, "tray_show_action"):
             self.tray_show_action.setText(self._t("显示 ModelScope Manager"))
@@ -3904,7 +4228,7 @@ class MainWindow(FluentWindow):
             if acrylic and supported:
                 self.graphics_status.setText("Mica 由 FluentWindow 和 Windows 合成器单层渲染。")
             elif acrylic:
-                self.graphics_status.setText("当前系统不支持 Mica，已使用不透明背景以避免残影。")
+                self.graphics_status.setText(self._t("当前系统不支持 Mica，已使用不透明背景以避免残影。"))
             else:
                 self.graphics_status.setText("Mica 已关闭，使用低开销不透明背景。")
 
@@ -4018,6 +4342,10 @@ class MainWindow(FluentWindow):
     def _drop_upload_threshold_changed(self, value: int) -> None:
         if not self._restoring_settings:
             self.settings.setValue("upload/drop_threshold_mb", value)
+
+    def _upload_queue_count_changed(self, value: int) -> None:
+        if not self._restoring_settings:
+            self.settings.setValue("upload/queue_count", value)
 
     def _save_preview_settings(self) -> None:
         if self._restoring_settings:
@@ -4557,7 +4885,7 @@ class MainWindow(FluentWindow):
         host = str(self.alist_host_combo.currentData())
         shown_host = "127.0.0.1" if host == "127.0.0.1" else self._local_ip()
         self.alist_url_label.setText(self._tf(
-            "WebDAV 地址：{url}", url=f"http://{shown_host}:{self.alist_port.value()}/"
+            "WebDAV 地址：{url}", url=f"http://{shown_host}:{self.alist_port.value()}/dav/"
         ))
 
     def _save_alist_settings(self) -> None:
@@ -5653,10 +5981,10 @@ class MainWindow(FluentWindow):
         if not entry.is_dir and not public:
             QMessageBox.information(
                 self,
-                "私有资源 API 直链",
-                "直链将以 API 形式复制。链接中不包含 Token，但访问者仍需拥有该私有仓库的权限。",
+                self._t("私有资源 API 直链"),
+                self._t("直链将以 API 形式复制。链接中不包含 Token，但访问者仍需拥有该私有仓库的权限。"),
             )
-            self.repo_heading.setText("私有资源 API 直链已复制")
+            self.repo_heading.setText(self._t("私有资源 API 直链已复制"))
         else:
             self.repo_heading.setText(self._t(message))
 
@@ -5701,9 +6029,9 @@ class MainWindow(FluentWindow):
         menu = QMenu(self)
         menu.setToolTipsVisible(True)
         link_action = menu.addAction(self._t("复制链接" if entry.is_dir else "复制直链"))
-        copy_action = menu.addAction("复制")
-        paste_action = menu.addAction("粘贴") if self.copy_source and not self.selected_repo_public else None
-        paste_move_action = menu.addAction("粘贴移动") if self.move_source and not self.selected_repo_public else None
+        copy_action = menu.addAction(self._t("复制"))
+        paste_action = menu.addAction(self._t("粘贴")) if self.copy_source and not self.selected_repo_public else None
+        paste_move_action = menu.addAction(self._t("粘贴移动")) if self.move_source and not self.selected_repo_public else None
         download_action = menu.addAction(self._t("添加到下载队列"))
         builtin_action = None
         player_actions: dict[QAction, dict[str, str]] = {}
@@ -5715,7 +6043,7 @@ class MainWindow(FluentWindow):
                 name = player.get("name") or f"播放器 {index + 1}"
                 action = player_menu.addAction(name)
                 player_actions[action] = player
-        tag_menu = menu.addMenu("标签")
+        tag_menu = menu.addMenu(self._t("标签"))
         assigned_tags = set(self.account_store.tags_for_entry(tag_account_id, repo.repo_type, repo.repo_id, entry.path))
         tag_actions: dict[QAction, str] = {}
         for tag in self.account_store.all_tags():
@@ -5805,16 +6133,17 @@ class MainWindow(FluentWindow):
     ) -> None:
         session = self._web_session_for_key(account_key)
         if session is None:
-            QMessageBox.information(self, "需要在线登录", "转到设置页面添加账号。")
+            QMessageBox.information(self, self._t("需要在线登录"), self._t("转到设置页面添加账号。"))
             return
         paths = self._entry_file_paths(entry, entries)
         if not paths:
-            QMessageBox.information(self, "删除", "文件夹中没有可删除的文件。")
+            QMessageBox.information(self, self._t("删除"), self._t("文件夹中没有可删除的文件。"))
             return
         answer = QMessageBox.warning(
             self,
-            "确认删除",
-            f"此操作不可逆，确定删除“{entry.path}”？" + (f"\n将递归删除 {len(paths)} 个文件。" if entry.is_dir else ""),
+            self._t("确认删除"),
+            self._tf("此操作不可逆，确定删除“{path}”？", path=entry.path)
+            + (self._tf("\n将递归删除 {count} 个文件。", count=len(paths)) if entry.is_dir else ""),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -5826,7 +6155,7 @@ class MainWindow(FluentWindow):
                 key, value, result, path,
             )
         )
-        self.delete_task.failed.connect(lambda error: QMessageBox.warning(self, "删除失败", error))
+        self.delete_task.failed.connect(lambda error: QMessageBox.warning(self, self._t("删除失败"), error))
         self.delete_task.finished.connect(self.delete_task.deleteLater)
         self.delete_task.start()
         self._log(f"开始删除：{repo.repo_id}/{entry.path} · {len(paths)} 个文件")
@@ -5888,9 +6217,9 @@ class MainWindow(FluentWindow):
         )
         self._log(f"删除完成：{len(deleted)} 个成功，{len(failures)} 个失败")
         if failures:
-            QMessageBox.warning(self, "删除完成", f"已删除 {len(deleted)} 个文件，{len(failures)} 个失败。")
+            QMessageBox.warning(self, self._t("删除完成"), self._tf("已删除 {deleted} 个文件，{failed} 个失败。", deleted=len(deleted), failed=len(failures)))
         else:
-            QMessageBox.information(self, "删除完成", f"已删除 {len(deleted)} 个文件，当前目录已刷新。")
+            QMessageBox.information(self, self._t("删除完成"), self._tf("已删除 {count} 个文件，当前目录已刷新。", count=len(deleted)))
 
     def _confirm_relocate_threshold(self, entry: RemoteEntry, entries: list[RemoteEntry], verb: str) -> bool:
         if entry.is_dir:
@@ -5930,22 +6259,22 @@ class MainWindow(FluentWindow):
             return
         source_key, source_service, source_repo, source_entries, selected = self.move_source
         if self._web_session_for_key(source_key) is None:
-            QMessageBox.information(self, "需要在线登录", "转到设置页面添加账号。")
+            QMessageBox.information(self, self._t("需要在线登录"), self._t("转到设置页面添加账号。"))
             return
         upload_service = self._token_service_for_repo(destination_repo)
         if upload_service is None:
             QMessageBox.information(
-                self, "需要 Token 账户", "请先添加可访问目标仓库的 Token 账户；上传不会使用网页登录接口。",
+                self, self._t("需要 Token 账户"), self._t("请先添加可访问目标仓库的 Token 账户；上传不会使用网页登录接口。"),
             )
             return
         target = normalize_remote_path(destination_folder, Path(selected.path).name)
         if source_repo == destination_repo and source_key == destination_key:
             source_path = selected.path.strip("/")
             if target == source_path:
-                QMessageBox.information(self, "移动", "目标路径与原路径相同。")
+                QMessageBox.information(self, self._t("移动"), self._t("目标路径与原路径相同。"))
                 return
             if selected.is_dir and (destination_folder == source_path or destination_folder.startswith(source_path + "/")):
-                QMessageBox.warning(self, "移动", "不能把文件夹移动到其自身或子目录中。")
+                QMessageBox.warning(self, self._t("移动"), self._t("不能把文件夹移动到其自身或子目录中。"))
                 return
         if not self._confirm_relocate_threshold(selected, source_entries, "移动"):
             return
@@ -5961,23 +6290,23 @@ class MainWindow(FluentWindow):
     ) -> None:
         current_name = Path(entry.path).name
         new_name, accepted = QInputDialog.getText(
-            self, "重命名（区分大小写）", "新名称（区分大小写）：", text=current_name,
+            self, self._t("重命名（区分大小写）"), self._t("新名称（区分大小写）："), text=current_name,
         )
         new_name = new_name.strip()
         if not accepted:
             return
         if not new_name or new_name in {".", ".."} or "/" in new_name or "\\" in new_name:
-            QMessageBox.warning(self, "重命名", "请输入不包含路径分隔符的有效名称。")
+            QMessageBox.warning(self, self._t("重命名"), self._t("请输入不包含路径分隔符的有效名称。"))
             return
         if new_name == current_name:
-            QMessageBox.information(self, "重命名", "新名称与原名称相同。")
+            QMessageBox.information(self, self._t("重命名"), self._t("新名称与原名称相同。"))
             return
         if not self._confirm_relocate_threshold(entry, entries, "重命名"):
             return
         upload_service = self._token_service_for_repo(repo)
         if upload_service is None:
             QMessageBox.information(
-                self, "需要 Token 账户", "请先添加可访问该仓库的 Token 账户；上传不会使用网页登录接口。",
+                self, self._t("需要 Token 账户"), self._t("请先添加可访问该仓库的 Token 账户；上传不会使用网页登录接口。"),
             )
             return
         parent = entry.path.rpartition("/")[0]
@@ -5999,11 +6328,11 @@ class MainWindow(FluentWindow):
         mappings: dict[str, str],
     ) -> None:
         if not mappings:
-            QMessageBox.information(self, "操作", "没有可传输的文件。")
+            QMessageBox.information(self, self._t("操作"), self._t("没有可传输的文件。"))
             return
         session = self._web_session_for_key(source_key)
         if session is None:
-            QMessageBox.information(self, "需要在线登录", "转到设置页面添加账号。")
+            QMessageBox.information(self, self._t("需要在线登录"), self._t("转到设置页面添加账号。"))
             return
         self.relocate_context = (source_key, source_repo, destination_key, destination_repo, source_entries)
         self.relocate_task = RelocateThread(
@@ -6016,7 +6345,7 @@ class MainWindow(FluentWindow):
             self,
         )
         self.relocate_task.completed.connect(self._relocate_completed)
-        self.relocate_task.failed.connect(lambda error: QMessageBox.warning(self, "操作失败", error))
+        self.relocate_task.failed.connect(lambda error: QMessageBox.warning(self, self._t("操作失败"), error))
         self.relocate_task.finished.connect(self.relocate_task.deleteLater)
         self.relocate_task.start()
         self._log(f"开始下载、上传并移动：{len(mappings)} 个文件")
@@ -6043,13 +6372,13 @@ class MainWindow(FluentWindow):
         delete_failed = dict(result.get("delete_failed", {}))
         if upload_failed:
             message = f"{len(uploaded)} 个上传成功，{len(upload_failed)} 个上传失败；源文件未删除。"
-            QMessageBox.warning(self, "操作未完成", message)
+            QMessageBox.warning(self, self._t("操作未完成"), message)
         elif delete_failed:
             message = f"全部上传成功；{len(deleted)} 个源文件已删除，{len(delete_failed)} 个删除失败。"
-            QMessageBox.warning(self, "操作部分完成", message)
+            QMessageBox.warning(self, self._t("操作部分完成"), message)
         else:
             message = f"{len(uploaded)} 个文件上传完成并已删除原路径。"
-            QMessageBox.information(self, "操作完成", message)
+            QMessageBox.information(self, self._t("操作完成"), message)
             self.move_source = None
         self._log(message)
 
@@ -6060,7 +6389,7 @@ class MainWindow(FluentWindow):
         upload_service = self._token_service_for_repo(destination_repo)
         if upload_service is None:
             QMessageBox.information(
-                self, "需要 Token 账户", "请先添加可访问目标仓库的 Token 账户；上传不会使用网页登录接口。",
+                self, self._t("需要 Token 账户"), self._t("请先添加可访问目标仓库的 Token 账户；上传不会使用网页登录接口。"),
             )
             return
         if selected.is_dir:
@@ -6082,7 +6411,7 @@ class MainWindow(FluentWindow):
             upload_service, destination_repo, destination_folder, self,
         )
         self.copy_task.completed.connect(self._remote_copy_completed)
-        self.copy_task.failed.connect(lambda error: QMessageBox.warning(self, "复制失败", error))
+        self.copy_task.failed.connect(lambda error: QMessageBox.warning(self, self._t("复制失败"), error))
         self.copy_task.finished.connect(self.copy_task.deleteLater)
         self.copy_task.start()
         self._log(f"开始后台复制：{selected.path or '/'} → {destination_repo.repo_id}/{destination_folder}")
@@ -6090,14 +6419,14 @@ class MainWindow(FluentWindow):
     def _remote_copy_completed(self, ok: int, failed: int) -> None:
         self.copy_task = None
         self._log(f"复制完成：{ok} 个文件成功，{failed} 个失败；临时文件已清除")
-        QMessageBox.information(self, "复制完成", f"{ok} 个文件成功，{failed} 个失败。临时文件已清除。")
+        QMessageBox.information(self, self._t("复制完成"), self._tf("{ok} 个文件成功，{failed} 个失败。临时文件已清除。", ok=ok, failed=failed))
         self.load_remote_files()
 
     def _save_entry_tags(self, account_id: str, repo: Repository, path: str, tags: list[str]) -> None:
         try:
             saved = self.account_store.set_entry_tags(account_id, repo.repo_type, repo.repo_id, path, tags)
         except ValueError as exc:
-            QMessageBox.warning(self, "标签", str(exc))
+            QMessageBox.warning(self, self._t("标签"), str(exc))
             return
         self._refresh_tag_filter()
         self._log(f"标签已更新：{path or '/'} · {', '.join(saved) or '无'}")
@@ -6298,7 +6627,7 @@ class MainWindow(FluentWindow):
 
     def _repository_paths_dropped(self, raw_paths: list[str], directory: RemoteEntry) -> None:
         if self.selected_repo_public:
-            QMessageBox.information(self, "Public", "Public 仓库为只读挂载，不能上传。")
+            QMessageBox.information(self, "Public", self._t("Public 仓库为只读挂载，不能上传。"))
             return
         if not self.service and not self.upload_session_service:
             self._prompt_for_settings()
@@ -6313,7 +6642,7 @@ class MainWindow(FluentWindow):
             self.upload_session_repo
             and repository_identity(self.upload_session_repo) != repository_identity(self.selected_repo)
         ):
-            QMessageBox.information(self, self._t("传输进行中"), "请在当前上传队列完成后再切换目标仓库。")
+            QMessageBox.information(self, self._t("传输进行中"), self._t("请在当前上传队列完成后再切换目标仓库。"))
             return
         self.target_edit.setText(directory.path)
         total_size = local_paths_size(raw_paths)
@@ -6531,7 +6860,7 @@ class MainWindow(FluentWindow):
         self.active_download_specs.clear()
         self.download_table.setRowCount(0)
         self.download_progress.setValue(0)
-        self.download_stats.setText("速度：-- · 剩余：--")
+        self.download_stats.setText(self._t("速度：-- · 剩余：--"))
         self._update_download_enabled()
 
     def _update_upload_enabled(self) -> None:
@@ -6556,6 +6885,70 @@ class MainWindow(FluentWindow):
         if self.backup_thread and self.backup_thread.isRunning():
             active = False
         self.download_button.setEnabled(active)
+
+    def _sample_transfer_statistics(self) -> None:
+        now = time.time()
+        active_upload = bool(
+            isinstance(self.task, UploadThread)
+            and self.task.isRunning()
+            and any(item.status == "uploading" for item in self.upload_items)
+        )
+        active_download = bool(isinstance(self.task, DownloadThread) and self.task.isRunning())
+        self.transfer_statistics.record_speeds(
+            now,
+            self.current_upload_speed if active_upload else 0,
+            self.current_download_speed if active_download else 0,
+        )
+        self.statistics_upload_value.setText(format_speed(self.current_upload_speed if active_upload else 0))
+        self.statistics_download_value.setText(format_speed(self.current_download_speed if active_download else 0))
+        if self.upload_health_monitor.update(
+            time.monotonic(), self.current_upload_speed, active_upload,
+        ):
+            worker = self.task
+            if isinstance(worker, UploadThread) and worker.isRunning():
+                worker.request_reconnect()
+                self._log(self._t(
+                    "上传速度连续 30 分钟低于自学习最大速度的一半；将在当前批次完成后重建连接"
+                ))
+        learned = self.upload_health_monitor.learned_speed
+        self.statistics_learned_value.setText(format_speed(learned))
+        if learned > 0:
+            self.statistics_note.setText(self._tf(
+                "仅统计本次软件启动以来的数据；已学习上传最大速度：{speed}，慢速阈值：{threshold}。",
+                speed=format_speed(learned), threshold=format_speed(learned / 2),
+            ))
+        if self.queue_tabs.currentIndex() == 2:
+            self._refresh_transfer_statistics()
+
+    def _refresh_transfer_statistics(self) -> None:
+        start = self.statistics_start_edit.dateTime().toSecsSinceEpoch()
+        if self.statistics_live_checkbox.isChecked():
+            end = int(time.time())
+            self.statistics_end_edit.setDateTime(QDateTime.fromSecsSinceEpoch(end))
+        else:
+            end = self.statistics_end_edit.dateTime().toSecsSinceEpoch()
+        if start > end:
+            start, end = end, start
+        samples = self.transfer_statistics.query(start, end)
+        upload_total, download_total = self.transfer_statistics.totals(start, end)
+        self.statistics_summary.setText(self._tf(
+            "上传总量：{upload}    下载总量：{download}",
+            upload=format_size(upload_total), download=format_size(download_total),
+        ))
+        upload_speeds = [sample.upload_speed for sample in samples]
+        download_speeds = [sample.download_speed for sample in samples]
+        self.upload_chart_metrics.setText(self._tf(
+            "平均 {average}  ·  峰值 {peak}",
+            average=format_speed(sum(upload_speeds) / max(1, len(upload_speeds))),
+            peak=format_speed(max(upload_speeds, default=0)),
+        ))
+        self.download_chart_metrics.setText(self._tf(
+            "平均 {average}  ·  峰值 {peak}",
+            average=format_speed(sum(download_speeds) / max(1, len(download_speeds))),
+            peak=format_speed(max(download_speeds, default=0)),
+        ))
+        self.upload_chart.set_data(samples, start, end)
+        self.download_chart.set_data(samples, start, end)
 
     def start_upload(self) -> None:
         if isinstance(self.task, UploadThread) and self.task.isRunning():
@@ -6621,12 +7014,15 @@ class MainWindow(FluentWindow):
             self.upload_session_repo,
             item,
             self.keep_folder_name.isChecked(),
+            self.upload_queue_count.value(),
             oversized,
             self,
         )
         worker.item_done.connect(self._upload_item_done)
         worker.cancelled.connect(self._upload_cancelled)
         worker.progress_info.connect(self._upload_progress_info)
+        worker.bytes_transferred.connect(self._record_upload_bytes)
+        worker.reconnect_ready.connect(self._upload_reconnect_ready)
         worker.finished.connect(lambda: self._upload_thread_finished(worker))
         worker.finished.connect(worker.deleteLater)
         self.task = worker
@@ -6649,6 +7045,15 @@ class MainWindow(FluentWindow):
         for item in self.upload_items:
             if str(item.path) == path and item.status == "uploading":
                 self._set_upload_status(item, "uploading", f"{percent}%")
+                break
+
+    def _record_upload_bytes(self, amount: int) -> None:
+        self.transfer_statistics.add_bytes(time.time(), upload=amount)
+
+    def _upload_reconnect_ready(self, path: str) -> None:
+        for item in self.upload_items:
+            if str(item.path) == path and item.status == "uploading":
+                self._set_upload_status(item, "waiting", self._t("等待重连"))
                 break
 
     def _upload_item_done(self, path: str, success: bool, message: str) -> None:
@@ -6678,6 +7083,16 @@ class MainWindow(FluentWindow):
         self.cancel_upload_button.setEnabled(False)
         self._update_upload_enabled()
         self._update_download_enabled()
+        pending_upload = any(item.status == "waiting" for item in self.upload_items)
+        if worker.stopped_for_reconnect and pending_upload and self.upload_session_service:
+            try:
+                self.upload_session_service.reconnect()
+            except Exception as exc:
+                self._log(self._tf("上传连接重建失败，将继续尝试：{error}", error=exc))
+            else:
+                self._log(self._t("上传连接已重建，将继续剩余队列"))
+        if worker.stopped_for_reconnect:
+            self.upload_health_monitor.reset_after_reconnect()
         QTimer.singleShot(0, self._start_next_upload)
 
     def pause_upload(self) -> None:
@@ -6712,7 +7127,7 @@ class MainWindow(FluentWindow):
             return
         self.progress.setRange(0, 100)
         self.progress.setValue(100)
-        self.upload_stats.setText("速度：0 B/s · 剩余：00:00")
+        self.upload_stats.setText(self._t("速度：0 B/s · 剩余：00:00"))
         if self.upload_ok and self.upload_session_repo and self.upload_session_account_id:
             self._mark_repository_dirty(self.upload_session_account_id, self.upload_session_repo)
             self.repo_heading.setText(self._t("上传完成，目录将在空闲时自动刷新"))
@@ -6754,14 +7169,18 @@ class MainWindow(FluentWindow):
         )
         self.download_runner = runner
         self.current_download_speed = 0.0
+        self._download_stat_last_completed = sum(
+            min(spec.size, spec.local_path.stat().st_size)
+            for spec in specs if spec.local_path.exists()
+        )
         self.active_download_specs = list(specs)
         self.download_progress.setValue(0)
-        self.download_stats.setText("速度：0 B/s · 剩余：--")
+        self.download_stats.setText(self._t("速度：0 B/s · 剩余：--"))
         active_paths = {str(spec.local_path) for spec in specs}
         for row, spec in enumerate(self.download_specs):
             if str(spec.local_path) in active_paths:
                 self.download_states[str(spec.local_path)] = "waiting"
-                self.download_table.item(row, 2).setText("准备下载")
+                self.download_table.item(row, 2).setText(self._t("准备下载"))
         worker = DownloadThread(runner, specs, self)
         worker.progress_info.connect(self._download_progress_info)
         worker.item_update.connect(self._download_item_update)
@@ -6790,7 +7209,7 @@ class MainWindow(FluentWindow):
             self.current_download_speed = 0.0
             self.pause_download_button.setEnabled(False)
             self.resume_download_button.setEnabled(True)
-            self.download_stats.setText("已暂停 · 已下载内容会保留")
+            self.download_stats.setText(self._t("已暂停 · 已下载内容会保留"))
             self._log("下载已暂停")
 
     def resume_download(self) -> None:
@@ -6819,11 +7238,15 @@ class MainWindow(FluentWindow):
             self.pause_download_button.setEnabled(False)
             self.resume_download_button.setEnabled(False)
             self.stop_download_button.setEnabled(False)
-            self.download_stats.setText("正在停止… · 已下载内容不会删除")
+            self.download_stats.setText(self._t("正在停止… · 已下载内容不会删除"))
             self._log("正在停止下载，已下载内容和断点文件将保留")
 
     def _download_progress_info(self, completed: int, total: int, speed: float, eta: int) -> None:
         self.current_download_speed = max(0.0, speed)
+        downloaded = max(0, completed - self._download_stat_last_completed)
+        self._download_stat_last_completed = max(self._download_stat_last_completed, completed)
+        if downloaded:
+            self.transfer_statistics.add_bytes(time.time(), download=downloaded)
         percent = running_download_percent(completed, total)
         # Completion owns the 100% state.  A running snapshot may briefly report
         # all bytes before aria2 and checksum verification have actually finished.
@@ -6886,10 +7309,10 @@ class MainWindow(FluentWindow):
         self.resume_download_button.setEnabled(False)
         self.stop_download_button.setEnabled(False)
         if stopped:
-            self.download_stats.setText("已停止 · 已下载内容和断点已保留")
+            self.download_stats.setText(self._t("已停止 · 已下载内容和断点已保留"))
         else:
             self.download_progress.setValue(100)
-            self.download_stats.setText("速度：0 B/s · 剩余：00:00")
+            self.download_stats.setText(self._t("速度：0 B/s · 剩余：00:00"))
         self._update_upload_enabled()
         self._update_download_enabled()
         if stopped:

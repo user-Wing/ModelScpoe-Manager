@@ -1,4 +1,4 @@
-# ModelScope Manager 1.0.4
+# ModelScope Manager 1.0.5
 
 Windows 桌面端 ModelScope 仓库资源管理器，使用官方 `modelscope-hub` Python SDK。
 
@@ -91,10 +91,10 @@ WebDAV 启动前会检查端口占用；若当前端口不可用，程序会自�
 
 - 驱动：`WebDAV`
 - 厂商：`其他`
-- 地址：使用设置页显示的 WebDAV URL；同一台电脑通常为 `http://127.0.0.1:9867/`
-- 根文件夹路径：填写 `/` 或留空
+- 地址：使用设置页显示的 WebDAV URL；同一台电脑通常为 `http://127.0.0.1:9867/dav/`（原有根地址 `http://127.0.0.1:9867/` 仍兼容）
+- 根文件夹路径：挂载全部内容时填写 `/` 或留空；只挂载子目录时填写 `/models`、`/datasets` 或 `/public`
 - 用户名和密码：使用设置页中显示的值
-- AList 位于 Docker 时，可使用 `http://host.docker.internal:9867/`，或选择局域网监听并使用设置页显示的局域网 IP
+- AList 位于 Docker 时，可使用 `http://host.docker.internal:9867/dav/`，或选择局域网监听并使用设置页显示的局域网 IP
 
 WebDAV 根目录始终包含 `models`、`datasets`、`public`，其中个人仓库会合并已验证账户的可用仓库：
 

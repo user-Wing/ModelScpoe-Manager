@@ -414,11 +414,29 @@ class _WebDAVHandler(BaseHTTPRequestHandler):
         expected = base64.b64encode(f"{self.manager.username}:{self.manager.password}".encode()).decode()
         if hmac.compare_digest(self.headers.get("Authorization", ""), "Basic " + expected):
             return True
+        # A PROPFIND request commonly has an XML body.  Do not leave that body
+        # unread on a persistent connection: WebDAV clients may reuse the
+        # connection for the authenticated retry and corrupt the HTTP stream.
+        self.close_connection = True
         self.send_response(401)
         self.send_header("WWW-Authenticate", 'Basic realm="ModelScope Manager"')
         self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
         self.end_headers()
         return False
+
+    def _resource_path(self) -> str:
+        """Map the conventional /dav endpoint to the virtual DAV root."""
+        path = urlparse(self.path).path
+        if path == "/dav" or path == "/dav/":
+            return "/"
+        if path.startswith("/dav/"):
+            return path[4:]
+        return path
+
+    def _href_prefix(self) -> str:
+        path = urlparse(self.path).path
+        return "dav" if path == "/dav" or path.startswith("/dav/") else ""
 
     def _error(self, status: int, message: str) -> None:
         body = message.encode("utf-8")
@@ -445,14 +463,15 @@ class _WebDAVHandler(BaseHTTPRequestHandler):
             body_length = int(self.headers.get("Content-Length", "0") or 0)
             if body_length:
                 self.rfile.read(body_length)
-            node = self.manager.resolve(self.path)
+            node = self.manager.resolve(self._resource_path())
             if node is None:
                 self._error(404, "Not found")
                 return
             nodes = [node]
             if self.headers.get("Depth", "1") != "0" and node.is_dir:
                 nodes.extend(self.manager.children(node))
-            responses = "".join(self._xml_node(item) for item in nodes)
+            prefix = self._href_prefix()
+            responses = "".join(self._xml_node(item, prefix) for item in nodes)
             body = ('<?xml version="1.0" encoding="utf-8"?>'
                     '<d:multistatus xmlns:d="DAV:">' + responses + '</d:multistatus>').encode("utf-8")
         except Exception as exc:
@@ -465,8 +484,9 @@ class _WebDAVHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     @staticmethod
-    def _xml_node(node: DavNode) -> str:
-        href = "/" + quote(node.path, safe="/") + ("/" if node.is_dir and node.path else "")
+    def _xml_node(node: DavNode, prefix: str = "") -> str:
+        path = "/".join(part for part in (prefix.strip("/"), node.path.strip("/")) if part)
+        href = "/" + quote(path, safe="/") + ("/" if node.is_dir and path else "")
         resource = "<d:collection/>" if node.is_dir else ""
         modified = email.utils.formatdate(time.time(), usegmt=True)
         return (
@@ -488,7 +508,7 @@ class _WebDAVHandler(BaseHTTPRequestHandler):
         if not self._authorized():
             return
         try:
-            node = self.manager.resolve(self.path)
+            node = self.manager.resolve(self._resource_path())
             if node is None or node.is_dir or node.repo is None:
                 self._error(404, "File not found")
                 return
@@ -535,7 +555,7 @@ class _WebDAVHandler(BaseHTTPRequestHandler):
                 self._error(status, reservation_error)
                 return
             reserved = True
-            existed = self.manager.upload(self.path, self.rfile, length)
+            existed = self.manager.upload(self._resource_path(), self.rfile, length)
         except PermissionError as exc:
             self._error(403, str(exc))
             return
@@ -556,7 +576,7 @@ class _WebDAVHandler(BaseHTTPRequestHandler):
         if not self._authorized():
             return
         try:
-            self.manager.make_collection(self.path)
+            self.manager.make_collection(self._resource_path())
         except PermissionError as exc:
             self._error(403, str(exc))
             return
